@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Node & Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# User uploads & ephemeral session data
+data/uploads/*
+!data/uploads/.gitkeep
+
+# External / Full raw datasets (download instructions in data/README.md)
+data/Market-1501-v15.09.15/
+data/cuhk03/
+data/dukemtmc-reid/
+data/msmt17/
+data/viper/
+data/grid/
+data/ilids/
+*.zip
+*.tar.gz
+*.tar
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific: Keep lightweight sample data and trained weights
+!data/sample_market1501/
+!weights/osnet_discern.pth
+!results/
