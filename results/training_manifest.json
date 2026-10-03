@@ -1,0 +1,45 @@
+{
+  "models": [
+    {
+      "model_path": "C:\\Users\\sriva\\OneDrive\\Desktop\\ZED DIGITAL\\discern\\weights\\model_1_baseline.pth",
+      "trained": true,
+      "cached": true,
+      "use_stripes": false,
+      "use_margin_loss": false,
+      "use_lookalike_sampler": false
+    },
+    {
+      "model_path": "C:\\Users\\sriva\\OneDrive\\Desktop\\ZED DIGITAL\\discern\\weights\\model_2_margin_loss.pth",
+      "trained": true,
+      "cached": true,
+      "use_stripes": false,
+      "use_margin_loss": true,
+      "use_lookalike_sampler": false
+    },
+    {
+      "model_path": "C:\\Users\\sriva\\OneDrive\\Desktop\\ZED DIGITAL\\discern\\weights\\model_3_lookalike.pth",
+      "trained": true,
+      "epochs": 1,
+      "batches_per_epoch": 20,
+      "final_loss": 14.2984,
+      "use_stripes": false,
+      "use_margin_loss": true,
+      "use_lookalike_sampler": true,
+      "device": "cpu",
+      "training_time_sec": 73.89
+    },
+    {
+      "model_path": "C:\\Users\\sriva\\OneDrive\\Desktop\\ZED DIGITAL\\discern\\weights\\model_4_stripes.pth",
+      "trained": true,
+      "epochs": 1,
+      "batches_per_epoch": 20,
+      "final_loss": 14.0062,
+      "use_stripes": true,
+      "use_margin_loss": true,
+      "use_lookalike_sampler": true,
+      "device": "cpu",
+      "training_time_sec": 68.81
+    }
+  ],
+  "timestamp": "2026-10-02T12:25:14Z"
+}

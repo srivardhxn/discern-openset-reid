@@ -1,10 +1,10 @@
 {
   "cpu": {
     "device": "cpu",
-    "total_parameters": 615520,
-    "trainable_parameters": 615520,
-    "parameters_million": 0.616,
-    "latency_ms_per_image": 85.39,
-    "throughput_fps": 11.7
+    "total_parameters": 603744,
+    "trainable_parameters": 603744,
+    "parameters_million": 0.604,
+    "latency_ms_per_image": 232.39,
+    "throughput_fps": 4.3
   }
 }

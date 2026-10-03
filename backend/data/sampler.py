@@ -96,10 +96,12 @@ class LookAlikePKSampler(Sampler[List[int]]):
 
             for pid in selected_ids:
                 pool = id_pools[pid]
-                if len(pool) < self.k:
-                    # Replenish if exhausted
+                while len(pool) < self.k:
+                    # Replenish with replacement if identity has fewer samples than k
                     fresh = list(self.id_to_indices[pid])
                     self.rng.shuffle(fresh)
+                    if not fresh:
+                        break
                     pool.extend(fresh)
 
                 sampled = [pool.pop() for _ in range(self.k)]

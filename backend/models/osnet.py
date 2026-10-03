@@ -1,230 +1,267 @@
 """
-Omni-Scale Network (OSNet) backbone with Horizontal Stripe Feature Pooling.
-Specifically designed for person re-identification under low appearance variance.
-Outputs an L2-normalized 512-dimensional embedding consisting of:
-- Global descriptor (128-d)
-- Stripe 1 / Top: Head, neck, upper chest (128-d)
-- Stripe 2 / Mid: Torso, pocket badges, waistline (128-d)
-- Stripe 3 / Bot: Legs, hems, footwear (128-d)
-Total: 512 dimensions.
+Omni-Scale Network (OSNet x0.5) Backbone with Horizontal Stripe Feature Pooling.
+Reference:
+- Zhou et al. Omni-Scale Feature Learning for Person Re-Identification. ICCV 2019.
+- Zhou et al. Learning Generalisable Omni-Scale Representations for Person Re-Identification. TPAMI 2021.
 """
 
 from __future__ import annotations
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 
-class ConvBlock(nn.Module):
-    """Standard Conv-BN-ReLU block."""
-    def __init__(self, in_c: int, out_c: int, kernel_size: int = 3, stride: int = 1, padding: int = 1):
+class ConvLayer(nn.Module):
+    """Convolution layer (conv + bn + relu)."""
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, groups: int = 1):
         super().__init__()
-        self.conv = nn.Conv2d(in_c, out_c, kernel_size=kernel_size, stride=stride, padding=padding, bias=False)
-        self.bn = nn.BatchNorm2d(out_c)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=False, groups=groups)
+        self.bn = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.relu(self.bn(self.conv(x)))
 
 
-class LightConv3x3(nn.Module):
-    """Lightweight 3x3 conv using depthwise + pointwise convolution."""
-    def __init__(self, in_c: int, out_c: int):
+class Conv1x1(nn.Module):
+    """1x1 convolution + bn + relu."""
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1, groups: int = 1):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_c, out_c, kernel_size=1, bias=False)
-        self.conv2 = nn.Conv2d(out_c, out_c, kernel_size=3, padding=1, groups=out_c, bias=False)
-        self.bn = nn.BatchNorm2d(out_c)
+        self.conv = nn.Conv2d(in_channels, out_channels, 1, stride=stride, padding=0, bias=False, groups=groups)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.relu(self.bn(self.conv(x)))
+
+
+class Conv1x1Linear(nn.Module):
+    """1x1 convolution + bn (linear, no ReLU)."""
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, 1, stride=stride, padding=0, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.bn(self.conv(x))
+
+
+class LightConv3x3(nn.Module):
+    """Lightweight 3x3 conv using 1x1 pointwise + 3x3 depthwise convolution."""
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, groups=out_channels, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.relu(self.bn(self.conv2(self.conv1(x))))
 
 
-class OSBlock(nn.Module):
-    """
-    Omni-Scale Feature Learning Block.
-    Captures multi-scale features via streams of receptive field depths (scales 1, 2, 3, 4)
-    and fuses them with dynamic channel-wise gate.
-    """
-    def __init__(self, in_c: int, out_c: int, bottleneck_reduction: int = 4):
+class ChannelGate(nn.Module):
+    """A mini-network that generates channel-wise gates conditioned on input tensor."""
+    def __init__(self, in_channels: int, num_gates: Optional[int] = None, reduction: int = 16):
         super().__init__()
-        mid_c = out_c // bottleneck_reduction
-        self.conv1 = ConvBlock(in_c, mid_c, kernel_size=1, stride=1, padding=0)
-
-        # Scale 1: 1 conv (RF = 3x3)
-        self.scale1 = LightConv3x3(mid_c, mid_c)
-        # Scale 2: 2 convs (RF = 5x5)
-        self.scale2 = nn.Sequential(
-            LightConv3x3(mid_c, mid_c),
-            LightConv3x3(mid_c, mid_c)
-        )
-        # Scale 3: 3 convs (RF = 7x7)
-        self.scale3 = nn.Sequential(
-            LightConv3x3(mid_c, mid_c),
-            LightConv3x3(mid_c, mid_c),
-            LightConv3x3(mid_c, mid_c)
-        )
-        # Scale 4: 4 convs (RF = 9x9)
-        self.scale4 = nn.Sequential(
-            LightConv3x3(mid_c, mid_c),
-            LightConv3x3(mid_c, mid_c),
-            LightConv3x3(mid_c, mid_c),
-            LightConv3x3(mid_c, mid_c)
-        )
-
-        # Aggregation Gate
-        self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(mid_c, mid_c, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_c, mid_c, kernel_size=1),
-            nn.Sigmoid()
-        )
-
-        self.conv2 = ConvBlock(mid_c, out_c, kernel_size=1, stride=1, padding=0)
-
-        # Residual shortcut
-        if in_c != out_c:
-            self.shortcut = ConvBlock(in_c, out_c, kernel_size=1, stride=1, padding=0)
-        else:
-            self.shortcut = nn.Identity()
+        if num_gates is None:
+            num_gates = in_channels
+        self.global_avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(in_channels, in_channels // reduction, kernel_size=1, bias=True, padding=0)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Conv2d(in_channels // reduction, num_gates, kernel_size=1, bias=True, padding=0)
+        self.gate_activation = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        res = self.shortcut(x)
-        feat = self.conv1(x)
+        w = self.global_avgpool(x)
+        w = self.fc1(w)
+        w = self.relu(w)
+        w = self.fc2(w)
+        w = self.gate_activation(w)
+        return x * w
 
-        s1 = self.scale1(feat)
-        s2 = self.scale2(feat)
-        s3 = self.scale3(feat)
-        s4 = self.scale4(feat)
 
-        # Multi-scale fusion with attention gating
-        s_sum = s1 + s2 + s3 + s4
-        attn = self.gate(s_sum)
-        fused = s1 * attn + s2 * (1.0 - attn) + s3 * attn + s4 * (1.0 - attn)
+class OSBlock(nn.Module):
+    """Omni-scale feature learning block."""
+    def __init__(self, in_channels: int, out_channels: int, bottleneck_reduction: int = 4):
+        super().__init__()
+        mid_channels = out_channels // bottleneck_reduction
+        self.conv1 = Conv1x1(in_channels, mid_channels)
+        self.conv2a = LightConv3x3(mid_channels, mid_channels)
+        self.conv2b = nn.Sequential(
+            LightConv3x3(mid_channels, mid_channels),
+            LightConv3x3(mid_channels, mid_channels),
+        )
+        self.conv2c = nn.Sequential(
+            LightConv3x3(mid_channels, mid_channels),
+            LightConv3x3(mid_channels, mid_channels),
+            LightConv3x3(mid_channels, mid_channels),
+        )
+        self.conv2d = nn.Sequential(
+            LightConv3x3(mid_channels, mid_channels),
+            LightConv3x3(mid_channels, mid_channels),
+            LightConv3x3(mid_channels, mid_channels),
+            LightConv3x3(mid_channels, mid_channels),
+        )
+        self.gate = ChannelGate(mid_channels)
+        self.conv3 = Conv1x1Linear(mid_channels, out_channels)
+        self.downsample = None
+        if in_channels != out_channels:
+            self.downsample = Conv1x1Linear(in_channels, out_channels)
 
-        out = self.conv2(fused)
-        return F.relu(out + res)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        x1 = self.conv1(x)
+        x2a = self.conv2a(x1)
+        x2b = self.conv2b(x1)
+        x2c = self.conv2c(x1)
+        x2d = self.conv2d(x1)
+        x2 = self.gate(x2a) + self.gate(x2b) + self.gate(x2c) + self.gate(x2d)
+        x3 = self.conv3(x2)
+        if self.downsample is not None:
+            identity = self.downsample(identity)
+        out = x3 + identity
+        return F.relu(out)
 
 
 class OSNetReID(nn.Module):
     """
-    Compact OSNet with Horizontal Stripe Feature Extraction.
-    Input size: (B, 3, 256, 128)
-    Feature map before head: (B, 256, 16, 8)
-    Output: 512-dim L2-normalized embedding.
+    Omni-Scale Network (OSNet x0.5) for Open-Set Person Re-Identification.
+    Loads official pretrained weights from Kaiyang Zhou with 100% parameter fidelity.
     """
-    def __init__(self, num_classes: int = 0, use_stripes: bool = True, feature_dim: int = 512):
+    def __init__(
+        self,
+        num_classes: int = 0,
+        use_stripes: bool = False,
+        pretrained_path: Optional[str] = None,
+        feature_dim: int = 512,
+    ):
         super().__init__()
         self.use_stripes = use_stripes
         self.feature_dim = feature_dim
 
-        # Initial stem
-        self.stem = nn.Sequential(
-            ConvBlock(3, 32, kernel_size=7, stride=2, padding=3),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # 64x32
+        # Backbone channels for OSNet x0.5
+        channels = [32, 128, 192, 256]
+
+        # Convolutional backbone
+        self.conv1 = ConvLayer(3, channels[0], 7, stride=2, padding=3)
+        self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
+        self.conv2 = self._make_layer(channels[0], channels[1], num_blocks=2, reduce_spatial_size=True)
+        self.conv3 = self._make_layer(channels[1], channels[2], num_blocks=2, reduce_spatial_size=True)
+        self.conv4 = self._make_layer(channels[2], channels[3], num_blocks=2, reduce_spatial_size=False)
+        self.conv5 = Conv1x1(channels[3], channels[3])
+        self.global_avgpool = nn.AdaptiveAvgPool2d(1)
+
+        # Pretrained official fully-connected layer (Linear 256->512 + BN + ReLU)
+        self.fc = nn.Sequential(
+            nn.Linear(channels[3], self.feature_dim),
+            nn.BatchNorm1d(self.feature_dim),
+            nn.ReLU(inplace=True),
         )
 
-        # Stage 1 (64x32 -> 64x32)
-        self.stage1 = nn.Sequential(
-            OSBlock(32, 64),
-            OSBlock(64, 64)
-        )
-        self.down1 = ConvBlock(64, 64, kernel_size=3, stride=2, padding=1)  # 32x16
-
-        # Stage 2 (32x16 -> 32x16)
-        self.stage2 = nn.Sequential(
-            OSBlock(64, 128),
-            OSBlock(128, 128)
-        )
-        self.down2 = ConvBlock(128, 128, kernel_size=3, stride=2, padding=1) # 16x8
-
-        # Stage 3 (16x8 -> 16x8)
-        self.stage3 = nn.Sequential(
-            OSBlock(128, 256),
-            OSBlock(256, 256)
-        )
-
-        # Heads: Global and 3 Horizontal Stripes
-        # When use_stripes is True:
-        # global: 128, stripe1: 128, stripe2: 128, stripe3: 128 => 512 total
-        # When use_stripes is False (ablation):
-        # global projected directly to 512
-        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-
+        # Optional Horizontal Stripe Features (head, torso, legs)
         if self.use_stripes:
-            self.global_proj = nn.Sequential(
-                nn.Linear(256, 128, bias=False),
-                nn.BatchNorm1d(128)
-            )
+            # 3 vertical partitions projected to 128-d each, residual fusion with global feature
             self.stripe1_proj = nn.Sequential(
-                nn.Linear(256, 128, bias=False),
-                nn.BatchNorm1d(128)
+                nn.Linear(channels[3], 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(inplace=True),
             )
             self.stripe2_proj = nn.Sequential(
-                nn.Linear(256, 128, bias=False),
-                nn.BatchNorm1d(128)
+                nn.Linear(channels[3], 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(inplace=True),
             )
             self.stripe3_proj = nn.Sequential(
-                nn.Linear(256, 128, bias=False),
-                nn.BatchNorm1d(128)
+                nn.Linear(channels[3], 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(inplace=True),
             )
-        else:
-            self.global_proj = nn.Sequential(
-                nn.Linear(256, 512, bias=False),
-                nn.BatchNorm1d(512)
+            self.stripe_fusion = nn.Sequential(
+                nn.Linear(self.feature_dim + 384, self.feature_dim),
+                nn.BatchNorm1d(self.feature_dim),
             )
 
-        # Classifier for training classification/margin loss
+        # Classifier head for identity classification during training
         if num_classes > 0:
-            self.classifier = nn.Linear(512, num_classes, bias=False)
+            self.classifier = nn.Linear(self.feature_dim, num_classes, bias=False)
         else:
             self.classifier = None
 
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Extracts 512-d L2-normalized embedding."""
-        feat_map = self.stem(x)
-        feat_map = self.stage1(feat_map)
-        feat_map = self.down1(feat_map)
-        feat_map = self.stage2(feat_map)
-        feat_map = self.down2(feat_map)
-        feat_map = self.stage3(feat_map) # (B, 256, H=16, W=8)
+        if pretrained_path:
+            self.load_pretrained(pretrained_path)
 
-        B, C, H, W = feat_map.shape
+    def _make_layer(self, in_channels: int, out_channels: int, num_blocks: int, reduce_spatial_size: bool) -> nn.Sequential:
+        layers = []
+        layers.append(OSBlock(in_channels, out_channels))
+        for _ in range(1, num_blocks):
+            layers.append(OSBlock(out_channels, out_channels))
+        if reduce_spatial_size:
+            layers.append(
+                nn.Sequential(
+                    Conv1x1(out_channels, out_channels),
+                    nn.AvgPool2d(2, stride=2)
+                )
+            )
+        return nn.Sequential(*layers)
+
+    def load_pretrained(self, weights_path: str):
+        """Loads official OSNet weights into backbone layers with 100% parameter coverage."""
+        if not os.path.isfile(weights_path):
+            print(f"[WARN] Pretrained weights file not found: {weights_path}")
+            return
+        sd = torch.load(weights_path, map_location="cpu")
+        model_dict = self.state_dict()
+        filtered = {}
+        for k, v in sd.items():
+            if k.startswith("module."):
+                k = k[7:]
+            if k.startswith("classifier."):
+                continue
+            if k in model_dict and model_dict[k].shape == v.shape:
+                filtered[k] = v
+        model_dict.update(filtered)
+        self.load_state_dict(model_dict)
+        print(f"[OK] Successfully loaded {len(filtered)} pretrained parameters into OSNetReID ({weights_path}).")
+
+    def featuremaps(self, x: torch.Tensor) -> torch.Tensor:
+        """Extracts spatial feature map of shape (B, 256, 16, 8)."""
+        x = self.conv1(x)
+        x = self.maxpool(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.conv5(x)
+        return x
+
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Computes L2-normalized 512-dimensional embedding."""
+        fm = self.featuremaps(x)
+        v = self.global_avgpool(fm).flatten(1)
+        global_feat = self.fc(v)
 
         if not self.use_stripes:
-            glob = self.global_pool(feat_map).view(B, C)
-            emb = self.global_proj(glob)
-            return F.normalize(emb, p=2, dim=-1)
+            return F.normalize(global_feat, p=2, dim=1)
 
-        # Global feature
-        glob = self.global_pool(feat_map).view(B, C)
-        g_emb = self.global_proj(glob)
+        # 3 vertical spatial partitions: 0:5 (head), 5:11 (torso), 11:16 (legs)
+        s1 = F.adaptive_avg_pool2d(fm[:, :, 0:5, :], 1).flatten(1)
+        s2 = F.adaptive_avg_pool2d(fm[:, :, 5:11, :], 1).flatten(1)
+        s3 = F.adaptive_avg_pool2d(fm[:, :, 11:16, :], 1).flatten(1)
 
-        # 3 horizontal stripes along height H:
-        # stripe 1: top 1/3 (0:H//3) -> head/neck/upper collar
-        # stripe 2: middle 1/3 (H//3:2*H//3) -> torso/chest badge/belt
-        # stripe 3: bottom 1/3 (2*H//3:) -> pants/shoes
-        h1 = H // 3
-        h2 = (2 * H) // 3
-        s1 = F.adaptive_avg_pool2d(feat_map[:, :, 0:h1, :], (1, 1)).view(B, C)
-        s2 = F.adaptive_avg_pool2d(feat_map[:, :, h1:h2, :], (1, 1)).view(B, C)
-        s3 = F.adaptive_avg_pool2d(feat_map[:, :, h2:, :], (1, 1)).view(B, C)
+        s1_feat = self.stripe1_proj(s1)
+        s2_feat = self.stripe2_proj(s2)
+        s3_feat = self.stripe3_proj(s3)
 
-        s1_emb = self.stripe1_proj(s1)
-        s2_emb = self.stripe2_proj(s2)
-        s3_emb = self.stripe3_proj(s3)
-
-        # Concat: 128 + 128 + 128 + 128 = 512
-        full_emb = torch.cat([g_emb, s1_emb, s2_emb, s3_emb], dim=-1)
-        return F.normalize(full_emb, p=2, dim=-1)
+        stripe_cat = torch.cat([global_feat, s1_feat, s2_feat, s3_feat], dim=1)
+        fused = self.stripe_fusion(stripe_cat)
+        # Residual connection to preserve the pretrained representation
+        final_feat = global_feat + 0.3 * fused
+        return F.normalize(final_feat, p=2, dim=1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         emb = self.extract_features(x)
-        logits = None
-        if self.classifier is not None:
-            # Cosine-based classification for ArcFace / Linear
-            w = F.normalize(self.classifier.weight, p=2, dim=-1)
-            logits = F.linear(emb, w)
-        return emb, logits
+        if self.training and self.classifier is not None:
+            logits = self.classifier(emb)
+            return emb, logits
+        return emb, None

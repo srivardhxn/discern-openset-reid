@@ -1,0 +1,62 @@
+[
+  {
+    "model_name": "Model 1: Baseline (CrossEntropy + Random PK)",
+    "checkpoint": "C:\\Users\\sriva\\OneDrive\\Desktop\\ZED DIGITAL\\discern\\weights\\model_1_baseline.pth",
+    "epochs": 2,
+    "training_time_seconds": 172.23,
+    "standard_market1501": {
+      "rank1": 0.6186186186186187,
+      "rank5": 0.8228228228228228,
+      "map": 0.5325469564718078
+    },
+    "open_set_benchmark": {
+      "auroc": 0.8311206004140786,
+      "tar_1pct": 0.2976190476190476
+    }
+  },
+  {
+    "model_name": "Model 2: + Margin Loss (ArcFace + Random PK)",
+    "checkpoint": "C:\\Users\\sriva\\OneDrive\\Desktop\\ZED DIGITAL\\discern\\weights\\model_2_margin_loss.pth",
+    "epochs": 2,
+    "training_time_seconds": 181.12,
+    "standard_market1501": {
+      "rank1": 0.5615615615615616,
+      "rank5": 0.7717717717717718,
+      "map": 0.48304754345293716
+    },
+    "open_set_benchmark": {
+      "auroc": 0.8233048654244306,
+      "tar_1pct": 0.2857142857142857
+    }
+  },
+  {
+    "model_name": "Model 3: + Look-Alike Mining (ArcFace + LookAlike PK)",
+    "checkpoint": "C:\\Users\\sriva\\OneDrive\\Desktop\\ZED DIGITAL\\discern\\weights\\model_3_lookalike.pth",
+    "epochs": 2,
+    "training_time_seconds": 149.22,
+    "standard_market1501": {
+      "rank1": 0.5525525525525525,
+      "rank5": 0.7927927927927928,
+      "map": 0.4781253601477956
+    },
+    "open_set_benchmark": {
+      "auroc": 0.8108048654244306,
+      "tar_1pct": 0.31547619047619047
+    }
+  },
+  {
+    "model_name": "Model 4: + Horizontal Stripes (ArcFace + LookAlike PK + Stripes)",
+    "checkpoint": "C:\\Users\\sriva\\OneDrive\\Desktop\\ZED DIGITAL\\discern\\weights\\model_4_stripes.pth",
+    "epochs": 2,
+    "training_time_seconds": 132.87,
+    "standard_market1501": {
+      "rank1": 0.5555555555555556,
+      "rank5": 0.7927927927927928,
+      "map": 0.4801453163457695
+    },
+    "open_set_benchmark": {
+      "auroc": 0.8080615942028986,
+      "tar_1pct": 0.2857142857142857
+    }
+  }
+]

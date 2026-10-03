@@ -87,8 +87,8 @@ def main():
     print(f"      - Enrolled Identities   : {summary['num_enrolled_ids']}")
     print(f"      - Unenrolled Impostors  : {summary['num_unenrolled_ids']}")
     print(f"      - Gallery Samples       : {summary['num_gallery_samples']}")
-    print(f"      - Genuine Probes        : {summary['num_genuine_probes']}")
-    print(f"      - Impostor Probes       : {summary['num_impostor_probes']}")
+    print(f"      - Validation Probes     : {summary['num_val_genuine_probes']} genuine, {summary['num_val_impostor_probes']} impostors")
+    print(f"      - Test Probes           : {summary['num_test_genuine_probes']} genuine, {summary['num_test_impostor_probes']} impostors")
     print(f"      - Saved split to        : {split_path}")
 
     # Curate Low-Variance Look-Alike Subset

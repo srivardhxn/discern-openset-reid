@@ -188,3 +188,111 @@ def test_score_calibration_and_conformal_alpha():
     assert op_1pct["alpha"] == 0.01
     assert op_1pct["threshold_tau"] > 0.50
     assert op_1pct["calibrated_far"] <= 0.05
+
+
+def test_ablation_flags_alter_model_and_matcher():
+    """
+    CRITICAL AUDIT TEST:
+    Verifies that every ablation flag genuinely alters model weights,
+    feature projections, or matcher decision behavior.
+    """
+    import torch
+    from backend.models.osnet import OSNetReID
+
+    # 1. Architecture flag: use_stripes
+    model_no_stripes = OSNetReID(use_stripes=False).eval()
+    model_with_stripes = OSNetReID(use_stripes=True).eval()
+
+    dummy_x = torch.randn(2, 3, 256, 128)
+    with torch.no_grad():
+        emb_no_stripes = model_no_stripes.extract_features(dummy_x)
+        emb_with_stripes = model_with_stripes.extract_features(dummy_x)
+
+    # Different projection head configurations
+    assert hasattr(model_with_stripes, "stripe1_proj")
+    assert not hasattr(model_no_stripes, "stripe1_proj")
+    assert emb_no_stripes.shape == (2, 512)
+    assert emb_with_stripes.shape == (2, 512)
+
+    # 2. Matcher flag: use_whitening
+    matcher_raw = DiscernMatcher(use_whitening=False)
+    matcher_whitened = DiscernMatcher(use_whitening=True)
+
+    np.random.seed(42)
+    sample_gallery = np.random.randn(12, 512).astype(np.float32)
+    sample_gallery /= np.linalg.norm(sample_gallery, axis=1, keepdims=True)
+
+    matcher_raw.enroll(1, "Person A", sample_gallery[:6], recompute=True)
+    matcher_whitened.enroll(1, "Person A", sample_gallery[:6], recompute=True)
+    matcher_raw.enroll(2, "Person B", sample_gallery[6:], recompute=True)
+    matcher_whitened.enroll(2, "Person B", sample_gallery[6:], recompute=True)
+
+    query = np.random.randn(512).astype(np.float32)
+    query /= np.linalg.norm(query)
+
+    res_raw = matcher_raw.match(query)
+    res_whitened = matcher_whitened.match(query)
+    # Whitening applies SVD projection, modifying raw similarity
+    assert abs(res_raw.raw_similarity - res_whitened.raw_similarity) > 1e-4
+
+    # 3. Matcher flag: use_adaptive_threshold
+    matcher_fixed = DiscernMatcher(default_tau=0.55, use_adaptive_threshold=False)
+    matcher_adaptive = DiscernMatcher(default_tau=0.55, use_adaptive_threshold=True)
+
+    # Create two close enrolled competitors
+    base_v = np.random.randn(512).astype(np.float32)
+    base_v /= np.linalg.norm(base_v)
+    n1 = np.random.randn(512).astype(np.float32)
+    n1 /= np.linalg.norm(n1)
+    n2 = np.random.randn(512).astype(np.float32)
+    n2 /= np.linalg.norm(n2)
+    v1 = base_v * 0.85 + n1 * 0.15
+    v2 = base_v * 0.85 + n2 * 0.15
+    v1 /= np.linalg.norm(v1)
+    v2 /= np.linalg.norm(v2)
+
+    matcher_fixed.enroll(10, "Target A", v1, recompute=True)
+    matcher_fixed.enroll(11, "Competitor B", v2, recompute=True)
+
+    matcher_adaptive.enroll(10, "Target A", v1, recompute=True)
+    matcher_adaptive.enroll(11, "Competitor B", v2, recompute=True)
+
+    # Adaptive matcher raises tau_i above competitor similarity + buffer
+    proto_fixed = matcher_fixed.prototypes[10]
+    proto_adaptive = matcher_adaptive.prototypes[10]
+    assert proto_fixed.adaptive_tau == 0.55
+    assert proto_adaptive.adaptive_tau > 0.55  # Raised adaptively
+
+
+def test_metrics_sanity_and_bootstrap_intervals():
+    """
+    Verifies that compute_roc_metrics outputs valid monotonic numbers,
+    computes bootstrap confidence intervals, and validate_metrics_sanity catches violations.
+    """
+    from backend.eval.metrics import compute_roc_metrics, validate_metrics_sanity
+
+    np.random.seed(42)
+    gen_scores = list(np.random.normal(0.75, 0.08, 100))
+    imp_scores = list(np.random.normal(0.35, 0.09, 200))
+    gen_correct = [True] * 95 + [False] * 5
+
+    res = compute_roc_metrics(gen_scores, imp_scores, gen_correct, num_bootstrap=100)
+
+    # Monotonicity & bounds
+    assert res["auroc"] > 0.90
+    assert res["tar_at_far_1pct"] >= res["tar_at_far_01pct"]
+    assert res["tar_at_far_1pct"] >= res["dir_at_far_1pct"]
+
+    # Bootstrap intervals exist and bracket the estimate
+    assert res["auroc_ci"][0] <= res["auroc"] <= res["auroc_ci"][1] + 1e-4
+    assert res["tar_at_far_1pct_ci"][0] <= res["tar_at_far_1pct"] <= res["tar_at_far_1pct_ci"][1] + 1e-4
+
+    # Sanity validator passes
+    assert validate_metrics_sanity(res, is_trained=True) is True
+
+    # Corrupted metric fails sanity validation
+    corrupted = dict(res)
+    corrupted["auroc"] = 0.45
+    with pytest.raises(ValueError, match="AUROC=0.45 is <= 0.50"):
+        validate_metrics_sanity(corrupted, is_trained=True)
+

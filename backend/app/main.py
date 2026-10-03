@@ -93,27 +93,33 @@ def init_engine():
                 split_dict = json.load(f)
             gallery_samples = [ReIDSample(**s) for s in split_dict.get("gallery_samples", [])]
 
-            id_to_samples: Dict[int, List[str]] = {}
-            for s in gallery_samples:
-                if os.path.isfile(s.image_path):
-                    id_to_samples.setdefault(s.identity_id, []).append(s.image_path)
+            valid_samples = [s for s in gallery_samples if os.path.isfile(s.image_path)]
+            if valid_samples:
+                all_paths = [s.image_path for s in valid_samples]
+                all_embs = extractor.extract_batch(all_paths, batch_size=32)
+                id_to_embs = {}
+                id_to_paths = {}
+                for idx, s in enumerate(valid_samples):
+                    id_to_embs.setdefault(s.identity_id, []).append(all_embs[idx])
+                    id_to_paths.setdefault(s.identity_id, []).append(s.image_path)
 
-            for pid, paths in id_to_samples.items():
-                embs = extractor.extract_batch(paths)
-                matcher.enroll(
-                    identity_id=pid,
-                    name=f"Identity {pid}",
-                    embeddings=embs,
-                    image_paths=paths,
-                )
+                for pid, embs in id_to_embs.items():
+                    matcher.enroll(
+                        identity_id=pid,
+                        name=f"Identity {pid}",
+                        embeddings=np.array(embs),
+                        image_paths=id_to_paths[pid],
+                        recompute=False,
+                    )
+                matcher.recompute_gallery()
 
             # Fit calibrator using genuine and impostor validation scores
-            gen_samples = [s["image_path"] for s in split_dict.get("genuine_probe_samples", []) if os.path.isfile(s["image_path"])]
-            imp_samples = [s["image_path"] for s in split_dict.get("impostor_probe_samples", []) if os.path.isfile(s["image_path"])]
+            gen_samples = [s["image_path"] for s in split_dict.get("val_genuine_probes", split_dict.get("genuine_probe_samples", [])) if os.path.isfile(s["image_path"])]
+            imp_samples = [s["image_path"] for s in split_dict.get("val_impostor_probes", split_dict.get("impostor_probe_samples", [])) if os.path.isfile(s["image_path"])]
 
             if gen_samples and imp_samples:
-                g_embs = extractor.extract_batch(gen_samples[:30])
-                i_embs = extractor.extract_batch(imp_samples[:30])
+                g_embs = extractor.extract_batch(gen_samples[:32], batch_size=32)
+                i_embs = extractor.extract_batch(imp_samples[:32], batch_size=32)
                 g_scores = [matcher.match(e).raw_similarity for e in g_embs]
                 i_scores = [matcher.match(e).raw_similarity for e in i_embs]
                 matcher.calibrator.fit(g_scores, i_scores)

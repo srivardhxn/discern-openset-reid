@@ -63,9 +63,12 @@ print("[OK] Correctly returned 404:", r.json()["detail"])
 
 # 5. Case-Insensitive Duplicate Name Rejection
 print("\n[Edge 5] Case-Insensitive Duplicate Name Check ...")
-r = requests.post(f"{API}/enroll", data={"name": "identity 6"}, files={"files": ("test.jpg", tiny_buf.getvalue(), "image/jpeg")})
+gal_resp = requests.get(f"{API}/gallery")
+assert gal_resp.status_code == 200 and len(gal_resp.json()) > 0
+existing_gal_name = gal_resp.json()[0]["name"]
+r = requests.post(f"{API}/enroll", data={"name": existing_gal_name.lower()}, files={"files": ("test.jpg", tiny_buf.getvalue(), "image/jpeg")})
 assert r.status_code == 400
-print("[OK] Correctly rejected duplicate name 'identity 6' vs 'Identity 6':", r.json()["detail"])
+print(f"[OK] Correctly rejected duplicate name '{existing_gal_name.lower()}' vs '{existing_gal_name}':", r.json()["detail"])
 
 # 6. Extreme Operating Point Alpha Boundaries
 print("\n[Edge 6] Extreme Operating Point Alpha Boundaries (0.0001 and 0.50) ...")

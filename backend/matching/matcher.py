@@ -83,10 +83,11 @@ class DiscernMatcher:
         name: str,
         embeddings: np.ndarray,
         image_paths: Optional[List[str]] = None,
-    ) -> IdentityPrototype:
+        recompute: bool = True,
+    ) -> Optional[IdentityPrototype]:
         """
         Enrolls an identity with one or more sample embeddings.
-        Automatically triggers gallery re-fitting and prototype updates.
+        Automatically triggers gallery re-fitting and prototype updates unless recompute=False.
         """
         embs = np.atleast_2d(embeddings).astype(np.float32)
         # Ensure input embeddings are L2 normalized
@@ -100,8 +101,10 @@ class DiscernMatcher:
             "image_paths": paths,
         }
 
-        self.recompute_gallery()
-        return self.prototypes[identity_id]
+        if recompute:
+            self.recompute_gallery()
+            return self.prototypes[identity_id]
+        return None
 
     def delete(self, identity_id: int) -> bool:
         """Deletes an enrolled identity from gallery and re-fits whitening & prototypes."""
@@ -175,7 +178,7 @@ class DiscernMatcher:
 
             # Adaptive threshold tau_i: must be higher than the nearest enrolled competitor
             # with safety buffer (e.g., nearest_sim + 0.04) or default_tau, whichever is stricter
-            if nearest_lookalike_id is not None and max_cross_sim > 0.40:
+            if self.use_adaptive_threshold and nearest_lookalike_id is not None and max_cross_sim > 0.40:
                 proto_a.adaptive_tau = float(np.clip(max_cross_sim + 0.04, self.default_tau, 0.90))
             else:
                 proto_a.adaptive_tau = self.default_tau

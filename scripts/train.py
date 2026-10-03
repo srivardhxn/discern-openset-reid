@@ -1,10 +1,17 @@
 """
-Training script for Discern OSNet Re-ID backbone.
-Supports modular ablation flags:
-- --use-stripes
-- --use-margin-loss
-- --use-lookalike-sampler
-- --no-train (benchmarks latency/parameters and creates weights without lengthy training)
+Training script for Discern OSNet Re-ID backbone and ablation study checkpoints.
+
+Supports fine-tuning Kaiyang Zhou official pretrained OSNet weights on Market-1501:
+- Config 1: Baseline (Global pooling, CrossEntropy loss, Random PK sampler)
+- Config 2: + Margin Loss (Global pooling, ArcFace loss, Random PK sampler)
+- Config 3: + Look-Alike Mining (Global pooling, ArcFace loss, LookAlike PK sampler)
+- Config 4: + Horizontal Stripes (Stripe pooling, ArcFace loss, LookAlike PK sampler)
+
+Kaggle T4 / GPU Execution:
+    python scripts/train.py --device cuda --epochs 10 --batch-p 8 --batch-k 4 --lr 0.0003 --train-all-ablations
+
+Local CPU Fine-Tuning:
+    python scripts/train.py --device cpu --epochs 2 --max-batches 25 --train-all-ablations
 """
 
 from __future__ import annotations
@@ -13,7 +20,8 @@ import sys
 import json
 import argparse
 import time
-from typing import Dict, Any
+import shutil
+from typing import Dict, Any, Optional
 
 import torch
 import torch.nn as nn
@@ -50,9 +58,9 @@ class ReIDTorchDataset(Dataset):
         return tensor, label, s.identity_id
 
 
-def train_discern(
+def train_single_model(
     data_dir: str,
-    epochs: int = 5,
+    epochs: int = 2,
     p: int = 4,
     k: int = 4,
     lr: float = 0.0005,
@@ -60,18 +68,27 @@ def train_discern(
     use_margin_loss: bool = True,
     use_lookalike_sampler: bool = True,
     no_train: bool = False,
+    freeze_backbone: bool = False,
+    max_batches: Optional[int] = None,
+    pretrained_weights: str = "weights/osnet_x0_5_msmt17.pth",
     output_weights: str = "weights/osnet_discern.pth",
-    latency_output: str = "results/latency.json",
+    device_name: Optional[str] = None,
     seed: int = 42,
 ) -> Dict[str, Any]:
     torch.manual_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device_name is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device_name)
 
-    print("=" * 60)
-    print("DISCERN - MODEL TRAINING & BENCHMARKING")
-    print(f"Device: {device}")
-    print(f"Flags : use_stripes={use_stripes}, use_margin_loss={use_margin_loss}, use_lookalike_sampler={use_lookalike_sampler}")
-    print("=" * 60)
+    print("\n" + "=" * 65)
+    print(f"DISCERN - TRAINING MODEL: {os.path.basename(output_weights)}")
+    print(f"Device        : {device}")
+    print(f"Stripes Head  : {use_stripes}")
+    print(f"Loss Objective: {'ArcFace Margin Loss' if use_margin_loss else 'Cross-Entropy'}")
+    print(f"Batch Sampler : {'Look-Alike PK Mining' if use_lookalike_sampler else 'Uniform Random PK'}")
+    print(f"Pretrained    : {pretrained_weights if os.path.isfile(pretrained_weights) else 'None (random)'}")
+    print("=" * 65)
 
     dataset = Market1501Dataset(data_dir)
     train_samples = dataset.load_split("train")
@@ -83,40 +100,38 @@ def train_discern(
     pid_to_label = {pid: i for i, pid in enumerate(unique_pids)}
     num_classes = len(unique_pids)
 
-    print(f"Loaded {len(train_samples)} training samples across {num_classes} identities.")
-
-    # Initialize model
-    model = OSNetReID(num_classes=num_classes, use_stripes=use_stripes).to(device)
-
-    # Benchmark parameter count and latency
-    print("\n[1/3] Benchmarking Model Parameters and Inference Latency...")
-    os.makedirs(os.path.dirname(latency_output), exist_ok=True)
-    bench_cpu = benchmark_model(model, device_name="cpu", warmup_iters=5, test_iters=25)
-    bench_results = {"cpu": bench_cpu}
-
-    if torch.cuda.is_available():
-        bench_gpu = benchmark_model(model, device_name="cuda", warmup_iters=10, test_iters=50)
-        bench_results["gpu"] = bench_gpu
-        print(f"      GPU Latency: {bench_gpu['latency_ms_per_image']} ms/image ({bench_gpu['throughput_fps']} FPS)")
-
-    print(f"      CPU Latency: {bench_cpu['latency_ms_per_image']} ms/image ({bench_cpu['throughput_fps']} FPS)")
-    print(f"      Parameters : {bench_cpu['parameters_million']}M ({bench_cpu['total_parameters']:,} weights)")
-
-    with open(latency_output, "w", encoding="utf-8") as f:
-        json.dump(bench_results, f, indent=2)
-    print(f"      Saved latency benchmarks to: {latency_output}")
+    # Initialize model with pretrained weights
+    pretrained_to_load = pretrained_weights if (pretrained_weights and os.path.isfile(pretrained_weights)) else None
+    model = OSNetReID(
+        num_classes=num_classes,
+        use_stripes=use_stripes,
+        pretrained_path=pretrained_to_load,
+    ).to(device)
 
     os.makedirs(os.path.dirname(output_weights), exist_ok=True)
 
     if no_train:
-        print("\n[2/3] --no-train flag enabled: skipping SGD training passes.")
-        print(f"[3/3] Saving initialized backbone weights to: {output_weights}")
+        print("[REPORT] --no-train flag enabled: skipping SGD training passes.")
+        print(f"[REPORT] Saving initialized weights to: {output_weights}")
         torch.save(model.state_dict(), output_weights)
-        print("[OK] Training & Export complete.")
-        return bench_results
+        return {
+            "model_path": output_weights,
+            "trained": False,
+            "use_stripes": use_stripes,
+            "use_margin_loss": use_margin_loss,
+            "use_lookalike_sampler": use_lookalike_sampler,
+            "device": str(device),
+        }
+
+    # Optionally freeze earlier stages for ultra-fast local fine-tuning
+    if freeze_backbone:
+        for name, param in model.named_parameters():
+            if not any(k in name for k in ["proj", "classifier", "conv5"]):
+                param.requires_grad = False
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"      [Freezing Backbone] Optimizing {trainable:,} projection and head parameters.")
 
     # Set up DataLoader with Look-alike PK Sampler
-    print("\n[2/3] Setting up Training Pipeline...")
     cluster_info_path = os.path.join(PROJECT_ROOT, "results", "lowvar_subset.json")
     sampler = LookAlikePKSampler(
         samples=train_samples,
@@ -136,26 +151,33 @@ def train_discern(
         criterion_cls = nn.CrossEntropyLoss()
 
     criterion_triplet = BatchHardTripletLoss(margin=0.3)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=lr,
+        weight_decay=5e-4,
+    )
 
-    print(f"\n[3/3] Training for {epochs} epochs (Batch size={p*k}, Batches/epoch={len(sampler)})...")
+    total_batches_per_ep = len(sampler)
+    if max_batches is not None:
+        total_batches_per_ep = min(total_batches_per_ep, max_batches)
+
+    print(f"      Fine-tuning for {epochs} epochs ({total_batches_per_ep} batches/epoch, batch size {p*k})...")
     model.train()
+    start_train_time = time.time()
+
     for ep in range(1, epochs + 1):
         ep_loss = 0.0
-        batch_count = 0
+        batch_idx = 0
         t0 = time.time()
         for batch_x, batch_y, _ in loader:
+            batch_idx += 1
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
 
             optimizer.zero_grad()
             emb, logits = model(batch_x)
 
-            if use_margin_loss:
-                loss_c = criterion_cls(logits, batch_y)
-            else:
-                loss_c = criterion_cls(logits, batch_y)
-
+            loss_c = criterion_cls(logits, batch_y)
             loss_t = criterion_triplet(emb, batch_y)
             loss = loss_c + loss_t
 
@@ -163,51 +185,204 @@ def train_discern(
             optimizer.step()
 
             ep_loss += loss.item()
-            batch_count += 1
+
+            if max_batches is not None and batch_idx >= max_batches:
+                break
 
         dt = time.time() - t0
-        avg_loss = ep_loss / max(1, batch_count)
-        print(f"      Epoch [{ep}/{epochs}] - Loss: {avg_loss:.4f} - Time: {dt:.2f}s")
+        avg_loss = ep_loss / max(1, batch_idx)
+        print(f"      Epoch [{ep}/{epochs}] - Loss: {avg_loss:.4f} - Batches: {batch_idx} - Time: {dt:.2f}s")
 
+    elapsed_total = time.time() - start_train_time
     torch.save(model.state_dict(), output_weights)
-    print(f"\n[OK] Model successfully trained and saved to: {output_weights}")
-    print("=" * 60)
-    return bench_results
+    print(f"[OK] Trained weights saved successfully to: {output_weights} (Took {elapsed_total:.1f}s)")
+
+    return {
+        "model_path": output_weights,
+        "trained": True,
+        "epochs": epochs,
+        "batches_per_epoch": total_batches_per_ep,
+        "final_loss": round(avg_loss, 4),
+        "use_stripes": use_stripes,
+        "use_margin_loss": use_margin_loss,
+        "use_lookalike_sampler": use_lookalike_sampler,
+        "device": str(device),
+        "training_time_sec": round(elapsed_total, 2),
+    }
+
+
+def train_all_ablations(
+    data_dir: str,
+    epochs: int = 2,
+    p: int = 4,
+    k: int = 4,
+    lr: float = 0.0005,
+    no_train: bool = False,
+    freeze_backbone: bool = False,
+    max_batches: Optional[int] = 25,
+    pretrained_weights: str = "weights/osnet_x0_5_msmt17.pth",
+    device_name: Optional[str] = None,
+    skip_existing: bool = True,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    print("=" * 65)
+    print("DISCERN - MULTI-MODEL ABLATION TRAINING PIPELINE")
+    print("Training 4 distinct models across training-time configurations:")
+    print("  1. Baseline          : Stripes=No , MarginLoss=No , LookAlike=No")
+    print("  2. + Margin Loss     : Stripes=No , MarginLoss=Yes, LookAlike=No")
+    print("  3. + Look-Alike      : Stripes=No , MarginLoss=Yes, LookAlike=Yes")
+    print("  4. + Stripes (Full)  : Stripes=Yes, MarginLoss=Yes, LookAlike=Yes")
+    print("=" * 65)
+
+    configs = [
+        {
+            "name": "model_1_baseline",
+            "use_stripes": False,
+            "use_margin_loss": False,
+            "use_lookalike_sampler": False,
+            "out": os.path.join(PROJECT_ROOT, "weights", "model_1_baseline.pth"),
+        },
+        {
+            "name": "model_2_margin_loss",
+            "use_stripes": False,
+            "use_margin_loss": True,
+            "use_lookalike_sampler": False,
+            "out": os.path.join(PROJECT_ROOT, "weights", "model_2_margin_loss.pth"),
+        },
+        {
+            "name": "model_3_lookalike",
+            "use_stripes": False,
+            "use_margin_loss": True,
+            "use_lookalike_sampler": True,
+            "out": os.path.join(PROJECT_ROOT, "weights", "model_3_lookalike.pth"),
+        },
+        {
+            "name": "model_4_stripes",
+            "use_stripes": True,
+            "use_margin_loss": True,
+            "use_lookalike_sampler": True,
+            "out": os.path.join(PROJECT_ROOT, "weights", "model_4_stripes.pth"),
+        },
+    ]
+
+    manifest = {"models": [], "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+    for cfg in configs:
+        if skip_existing and os.path.isfile(cfg["out"]) and os.path.getsize(cfg["out"]) > 2_000_000:
+            print(f"\n[INFO] Skipping {os.path.basename(cfg['out'])}, already exists on disk.")
+            manifest["models"].append({
+                "model_path": cfg["out"],
+                "trained": True,
+                "cached": True,
+                "use_stripes": cfg["use_stripes"],
+                "use_margin_loss": cfg["use_margin_loss"],
+                "use_lookalike_sampler": cfg["use_lookalike_sampler"],
+            })
+            continue
+
+        res = train_single_model(
+            data_dir=data_dir,
+            epochs=epochs,
+            p=p,
+            k=k,
+            lr=lr,
+            use_stripes=cfg["use_stripes"],
+            use_margin_loss=cfg["use_margin_loss"],
+            use_lookalike_sampler=cfg["use_lookalike_sampler"],
+            no_train=no_train,
+            freeze_backbone=freeze_backbone,
+            max_batches=max_batches,
+            pretrained_weights=pretrained_weights,
+            output_weights=cfg["out"],
+            device_name=device_name,
+            seed=seed,
+        )
+        manifest["models"].append(res)
+
+    # Copy model_4_stripes.pth as the main production weights osnet_discern.pth
+    main_weights = os.path.join(PROJECT_ROOT, "weights", "osnet_discern.pth")
+    shutil.copy(configs[3]["out"], main_weights)
+    print(f"\n[OK] Copied Full Model ({configs[3]['out']}) -> {main_weights}")
+
+    # Benchmark parameter count and latency for full model
+    latency_output = os.path.join(PROJECT_ROOT, "results", "latency.json")
+    bm_model = OSNetReID(use_stripes=True, pretrained_path=main_weights).eval()
+    bench_cpu = benchmark_model(bm_model, device_name="cpu", warmup_iters=5, test_iters=25)
+    bench_data = {"cpu": bench_cpu}
+    if torch.cuda.is_available():
+        bench_gpu = benchmark_model(bm_model, device_name="cuda", warmup_iters=10, test_iters=50)
+        bench_data["gpu"] = bench_gpu
+    with open(latency_output, "w", encoding="utf-8") as f:
+        json.dump(bench_data, f, indent=2)
+
+    manifest_path = os.path.join(PROJECT_ROOT, "results", "training_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"[OK] Training manifest saved to: {manifest_path}")
+
+    return manifest
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Discern Re-ID Backbone")
+    parser = argparse.ArgumentParser(description="Train Discern Re-ID Backbone & Ablations")
     parser.add_argument("--data-dir", type=str, default=os.path.join(PROJECT_ROOT, "data", "sample_market1501"))
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-p", type=int, default=4)
     parser.add_argument("--batch-k", type=int, default=4)
     parser.add_argument("--lr", type=float, default=0.0005)
+    parser.add_argument("--pretrained-weights", type=str, default=os.path.join(PROJECT_ROOT, "weights", "osnet_x0_5_msmt17.pth"))
+    parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--use-stripes", action="store_true", default=True)
     parser.add_argument("--no-stripes", dest="use_stripes", action="store_false")
     parser.add_argument("--use-margin-loss", action="store_true", default=True)
     parser.add_argument("--no-margin-loss", dest="use_margin_loss", action="store_false")
     parser.add_argument("--use-lookalike-sampler", action="store_true", default=True)
     parser.add_argument("--no-lookalike-sampler", dest="use_lookalike_sampler", action="store_false")
-    parser.add_argument("--no-train", action="store_true", help="Fast test mode: skip training passes")
+    parser.add_argument("--no-train", action="store_true", help="Fallback mode: benchmark & export without SGD")
+    parser.add_argument("--freeze-backbone", action="store_true", default=True, help="Freeze lower conv layers for fast CPU fine-tuning")
+    parser.add_argument("--unfreeze-all", dest="freeze_backbone", action="store_false", help="Full end-to-end unfreeze (recommended for Kaggle T4 / GPU)")
+    parser.add_argument("--max-batches", type=int, default=25, help="Max batches per epoch for fast local fine-tuning")
+    parser.add_argument("--all-batches", dest="max_batches", action="store_const", const=None, help="Train on all dataset batches")
+    parser.add_argument("--train-all-ablations", action="store_true", help="Train all 4 distinct ablation models")
+    parser.add_argument("--retrain-all", action="store_true", help="Force retrain all models even if they exist")
     parser.add_argument("--output-weights", type=str, default=os.path.join(PROJECT_ROOT, "weights", "osnet_discern.pth"))
-    parser.add_argument("--latency-output", type=str, default=os.path.join(PROJECT_ROOT, "results", "latency.json"))
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
-    train_discern(
-        data_dir=args.data_dir,
-        epochs=args.epochs,
-        p=args.batch_p,
-        k=args.batch_k,
-        lr=args.lr,
-        use_stripes=args.use_stripes,
-        use_margin_loss=args.use_margin_loss,
-        use_lookalike_sampler=args.use_lookalike_sampler,
-        no_train=args.no_train,
-        output_weights=args.output_weights,
-        latency_output=args.latency_output,
-        seed=args.seed,
-    )
+
+    if args.train_all_ablations:
+        train_all_ablations(
+            data_dir=args.data_dir,
+            epochs=args.epochs,
+            p=args.batch_p,
+            k=args.batch_k,
+            lr=args.lr,
+            no_train=args.no_train,
+            freeze_backbone=args.freeze_backbone,
+            max_batches=args.max_batches,
+            pretrained_weights=args.pretrained_weights,
+            device_name=args.device,
+            skip_existing=not args.retrain_all,
+            seed=args.seed,
+        )
+    else:
+        train_single_model(
+            data_dir=args.data_dir,
+            epochs=args.epochs,
+            p=args.batch_p,
+            k=args.batch_k,
+            lr=args.lr,
+            use_stripes=args.use_stripes,
+            use_margin_loss=args.use_margin_loss,
+            use_lookalike_sampler=args.use_lookalike_sampler,
+            no_train=args.no_train,
+            freeze_backbone=args.freeze_backbone,
+            max_batches=args.max_batches,
+            pretrained_weights=args.pretrained_weights,
+            output_weights=args.output_weights,
+            device_name=args.device,
+            seed=args.seed,
+        )
 
 
 if __name__ == "__main__":

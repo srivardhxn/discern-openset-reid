@@ -42,9 +42,11 @@ def main():
             pid = f.split("_")[0]
             id_to_files[pid].append(f)
 
-    # Pick 36 identities with at least 4 views
-    selected_pids = [pid for pid in sorted(id_to_files.keys()) if len(id_to_files[pid]) >= 4][:36]
-    print(f"      Selected {len(selected_pids)} real pedestrian identities.", flush=True)
+    # Pick 210 identities: keep first 36 identical, add up to 210 with >= 3 views
+    first_36 = [pid for pid in sorted(id_to_files.keys()) if len(id_to_files[pid]) >= 4][:36]
+    remaining = [pid for pid in sorted(id_to_files.keys()) if pid not in first_36 and len(id_to_files[pid]) >= 3]
+    selected_pids = (first_36 + remaining)[:210]
+    print(f"      Selected {len(selected_pids)} real pedestrian identities (100+ enrolled, 100+ unenrolled).", flush=True)
 
     # Target folders
     train_dir = os.path.join(DATA_DIR, "bounding_box_train")
@@ -108,7 +110,7 @@ def main():
         return False
 
     completed = 0
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=16) as executor:
         futures = [executor.submit(fetch_and_save, item) for item in download_tasks]
         for f in as_completed(futures):
             if f.result():
