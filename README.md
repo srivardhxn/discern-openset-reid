@@ -38,28 +38,41 @@ Open two PowerShell terminals:
 
 ## 2. Training (Single T4 GPU / Kaggle / Colab)
 
-The compact OSNet Re-ID backbone is designed for fast, accessible training on a single NVIDIA T4 GPU in under 30 minutes, or runnable on CPU.
+The Re-ID pipeline trains on the full **Market-1501** dataset (751 train identities) using the proven **Bag of Tricks (BoT)** recipe on a single NVIDIA T4 GPU:
+- **Backbone**: `osnet_x1_0` pretrained on MSMT17 (with `osnet_x0_5` compact baseline comparison).
+- **Head**: BNNeck (`BatchNorm1d(512)` without bias shift).
+- **Loss**: Cross-Entropy with Label Smoothing ($0.1$) + Batch-Hard Triplet Loss (margin $0.3$).
+- **Batch Architecture**: PK Sampler with $P=16$ identities, $K=4$ images ($N=64$ batch size).
+- **Optimization**: Adam ($lr=3.5 \times 10^{-4}$ backbone, $10\times$ for new heads, weight decay $5 \times 10^{-4}$), 10-epoch linear warmup + cosine decay, Automatic Mixed Precision (AMP), 60 epochs.
+- **Model Selection**: Best checkpoint selected by **validation mAP**, not the last epoch.
 
 ### Ready-to-Run Kaggle Notebook & Script
-A ready-to-run Jupyter notebook (`kaggle_train.ipynb`) and standalone training script (`scripts/kaggle_train.py`) are provided for training all 4 ablation models end-to-end on a single NVIDIA T4 GPU:
+A ready-to-run Jupyter notebook (`kaggle_train.ipynb`) and standalone training script (`scripts/kaggle_train.py`) are provided:
 
 ```bash
-# Train all 4 ablation models (30+ epochs, all backbone layers unfrozen on T4 GPU)
+# Train all BoT ablation models (60 epochs, P=16, K=4, AMP on T4 GPU)
 python scripts/kaggle_train.py \
-    --device cuda \
-    --epochs 30 \
-    --batch-p 8 \
+    --data-dir data/Market-1501-v15.09.15 \
+    --epochs 60 \
+    --batch-p 16 \
     --batch-k 4 \
-    --lr 0.0003 \
-    --unfreeze-all
+    --lr 0.00035 \
+    --device cuda \
+    --run-ablation \
+    --include-arcface \
+    --include-x05
 ```
 
-This pipeline automatically trains and saves distinct checkpoints:
-- `weights/model_1_baseline.pth`: Cross-Entropy Loss + Uniform Random PK
-- `weights/model_2_margin_loss.pth`: ArcFace Angular Margin Loss + Uniform Random PK
-- `weights/model_3_lookalike.pth`: ArcFace Loss + Look-Alike Appearance Cluster PK Mining
-- `weights/model_4_stripes.pth`: 3 Horizontal Stripe Heads + ArcFace Loss + Look-Alike Mining
-- `weights/osnet_discern.pth`: Production deployment weights
+This pipeline automatically trains and saves distinct checkpoints to `weights/`:
+- `weights/model_1_strong_baseline.pth`: BoT Strong Baseline (BNNeck + Label Smoothing CE + Triplet)
+- `weights/model_2_lookalike_pk.pth`: + Look-Alike-Aware PK Sampler (clothing-color clusters across 751 IDs)
+- `weights/model_3_color_invariance.pth`: + Color-Invariance Augmentations (Grayscale, Channel Shuffle, Color Jitter)
+- `weights/model_4_stripes_strong.pth`: + Horizontal Stripe Heads (PCB spatial partitioning)
+- `weights/model_5_arcface_strong.pth`: + ArcFace Loss ($s=20, m=0.25$) replacing CE
+- `weights/osnet_x0_5_strong_baseline.pth`: OSNet x0.5 Compact Baseline comparison
+- `weights/osnet_x1_0_market1501_best.pth`: Best overall deployment weights (also copied to `weights/osnet_discern.pth`)
+
+All models are evaluated on the standard Market-1501 protocol (CMC Rank-1, Rank-5, mAP with strict junk and same-camera filtering) and logged to `results/kaggle_training_manifest.json`.
 
 ---
 

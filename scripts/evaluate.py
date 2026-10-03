@@ -135,10 +135,21 @@ def run_evaluation(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n[2/5] Loading 4 Fine-Tuned Model Weights ({device})...")
 
-    w_m1 = os.path.join(weights_dir, "model_1_baseline.pth")
-    w_m2 = os.path.join(weights_dir, "model_2_margin_loss.pth")
-    w_m3 = os.path.join(weights_dir, "model_3_lookalike.pth")
-    w_m4 = os.path.join(weights_dir, "model_4_stripes.pth")
+    w_m1 = os.path.join(weights_dir, "model_1_strong_baseline.pth")
+    if not os.path.isfile(w_m1):
+        w_m1 = os.path.join(weights_dir, "model_1_baseline.pth")
+
+    w_m2 = os.path.join(weights_dir, "model_2_lookalike_pk.pth")
+    if not os.path.isfile(w_m2):
+        w_m2 = os.path.join(weights_dir, "model_2_margin_loss.pth")
+
+    w_m3 = os.path.join(weights_dir, "model_3_color_invariance.pth")
+    if not os.path.isfile(w_m3):
+        w_m3 = os.path.join(weights_dir, "model_3_lookalike.pth")
+
+    w_m4 = os.path.join(weights_dir, "model_4_stripes_strong.pth")
+    if not os.path.isfile(w_m4):
+        w_m4 = os.path.join(weights_dir, "model_4_stripes.pth")
     if not os.path.isfile(w_m4):
         w_m4 = os.path.join(weights_dir, "osnet_discern.pth")
 

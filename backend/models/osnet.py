@@ -127,22 +127,64 @@ class OSBlock(nn.Module):
 
 class OSNetReID(nn.Module):
     """
-    Omni-Scale Network (OSNet x0.5) for Open-Set Person Re-Identification.
-    Loads official pretrained weights from Kaiyang Zhou with 100% parameter fidelity.
+    Omni-Scale Network (OSNet x1.0 and x0.5) for Open-Set Person Re-Identification.
+    Supports:
+    - Proven Bag of Tricks (BoT) BNNeck head for strong Re-ID metric learning
+    - Dual backbone width multipliers: x1.0 (standard 2.2M) and x0.5 (compact 0.6M)
+    - Horizontal stripe pooling heads (3 vertical partitions: head, torso, legs)
+    - Auto-detection of backbone scale and head config from pretrained checkpoint
     """
     def __init__(
         self,
         num_classes: int = 0,
+        width_mult: float = 1.0,
         use_stripes: bool = False,
+        use_bnneck: bool = True,
         pretrained_path: Optional[str] = None,
         feature_dim: int = 512,
     ):
         super().__init__()
-        self.use_stripes = use_stripes
         self.feature_dim = feature_dim
+        self.use_stripes = use_stripes
+        self.use_bnneck = use_bnneck
+        self.num_classes = num_classes
 
-        # Backbone channels for OSNet x0.5
-        channels = [32, 128, 192, 256]
+        # Auto-detect width_mult and head settings if a checkpoint is provided
+        if pretrained_path and os.path.isfile(pretrained_path):
+            try:
+                ckpt = torch.load(pretrained_path, map_location="cpu")
+                # Look for conv1.conv.weight in ckpt
+                for k, v in ckpt.items():
+                    clean_k = k[7:] if k.startswith("module.") else k
+                    if clean_k == "conv1.conv.weight":
+                        if v.shape[0] == 32:
+                            width_mult = 0.5
+                        elif v.shape[0] == 64:
+                            width_mult = 1.0
+                        elif v.shape[0] == 48:
+                            width_mult = 0.75
+                        break
+                    elif clean_k == "stripe1_proj.0.weight" and not use_stripes:
+                        use_stripes = True
+            except Exception:
+                pass
+
+        self.width_mult = width_mult
+        self.use_stripes = use_stripes
+
+        # Backbone channels based on width multiplier
+        if abs(width_mult - 1.0) < 1e-3:
+            channels = [64, 256, 384, 512]
+        elif abs(width_mult - 0.75) < 1e-3:
+            channels = [48, 192, 288, 384]
+        elif abs(width_mult - 0.5) < 1e-3:
+            channels = [32, 128, 192, 256]
+        elif abs(width_mult - 0.25) < 1e-3:
+            channels = [16, 64, 96, 128]
+        else:
+            channels = [int(64 * width_mult), int(256 * width_mult), int(384 * width_mult), int(512 * width_mult)]
+
+        self.channels = channels
 
         # Convolutional backbone
         self.conv1 = ConvLayer(3, channels[0], 7, stride=2, padding=3)
@@ -153,7 +195,7 @@ class OSNetReID(nn.Module):
         self.conv5 = Conv1x1(channels[3], channels[3])
         self.global_avgpool = nn.AdaptiveAvgPool2d(1)
 
-        # Pretrained official fully-connected layer (Linear 256->512 + BN + ReLU)
+        # Official fully-connected layer (Linear channels[3]->512 + BN + ReLU)
         self.fc = nn.Sequential(
             nn.Linear(channels[3], self.feature_dim),
             nn.BatchNorm1d(self.feature_dim),
@@ -162,7 +204,6 @@ class OSNetReID(nn.Module):
 
         # Optional Horizontal Stripe Features (head, torso, legs)
         if self.use_stripes:
-            # 3 vertical partitions projected to 128-d each, residual fusion with global feature
             self.stripe1_proj = nn.Sequential(
                 nn.Linear(channels[3], 128),
                 nn.BatchNorm1d(128),
@@ -183,9 +224,17 @@ class OSNetReID(nn.Module):
                 nn.BatchNorm1d(self.feature_dim),
             )
 
+        # Bag of Tricks BNNeck layer
+        if self.use_bnneck:
+            self.bnneck = nn.BatchNorm1d(self.feature_dim)
+            self.bnneck.bias.requires_grad_(False)
+            nn.init.constant_(self.bnneck.weight, 1.0)
+            nn.init.constant_(self.bnneck.bias, 0.0)
+
         # Classifier head for identity classification during training
         if num_classes > 0:
             self.classifier = nn.Linear(self.feature_dim, num_classes, bias=False)
+            nn.init.normal_(self.classifier.weight, std=0.001)
         else:
             self.classifier = None
 
@@ -207,7 +256,7 @@ class OSNetReID(nn.Module):
         return nn.Sequential(*layers)
 
     def load_pretrained(self, weights_path: str):
-        """Loads official OSNet weights into backbone layers with 100% parameter coverage."""
+        """Loads official OSNet weights into backbone layers with full parameter coverage."""
         if not os.path.isfile(weights_path):
             print(f"[WARN] Pretrained weights file not found: {weights_path}")
             return
@@ -222,11 +271,11 @@ class OSNetReID(nn.Module):
             if k in model_dict and model_dict[k].shape == v.shape:
                 filtered[k] = v
         model_dict.update(filtered)
-        self.load_state_dict(model_dict)
+        self.load_state_dict(model_dict, strict=False)
         print(f"[OK] Successfully loaded {len(filtered)} pretrained parameters into OSNetReID ({weights_path}).")
 
     def featuremaps(self, x: torch.Tensor) -> torch.Tensor:
-        """Extracts spatial feature map of shape (B, 256, 16, 8)."""
+        """Extracts spatial feature map of shape (B, channels[3], 16, 8)."""
         x = self.conv1(x)
         x = self.maxpool(x)
         x = self.conv2(x)
@@ -242,26 +291,64 @@ class OSNetReID(nn.Module):
         global_feat = self.fc(v)
 
         if not self.use_stripes:
-            return F.normalize(global_feat, p=2, dim=1)
+            feat = global_feat
+        else:
+            # 3 vertical spatial partitions: 0:5 (head), 5:11 (torso), 11:16 (legs)
+            s1 = F.adaptive_avg_pool2d(fm[:, :, 0:5, :], 1).flatten(1)
+            s2 = F.adaptive_avg_pool2d(fm[:, :, 5:11, :], 1).flatten(1)
+            s3 = F.adaptive_avg_pool2d(fm[:, :, 11:16, :], 1).flatten(1)
 
-        # 3 vertical spatial partitions: 0:5 (head), 5:11 (torso), 11:16 (legs)
-        s1 = F.adaptive_avg_pool2d(fm[:, :, 0:5, :], 1).flatten(1)
-        s2 = F.adaptive_avg_pool2d(fm[:, :, 5:11, :], 1).flatten(1)
-        s3 = F.adaptive_avg_pool2d(fm[:, :, 11:16, :], 1).flatten(1)
+            s1_feat = self.stripe1_proj(s1)
+            s2_feat = self.stripe2_proj(s2)
+            s3_feat = self.stripe3_proj(s3)
 
-        s1_feat = self.stripe1_proj(s1)
-        s2_feat = self.stripe2_proj(s2)
-        s3_feat = self.stripe3_proj(s3)
+            stripe_cat = torch.cat([global_feat, s1_feat, s2_feat, s3_feat], dim=1)
+            fused = self.stripe_fusion(stripe_cat)
+            feat = global_feat + 0.3 * fused
 
-        stripe_cat = torch.cat([global_feat, s1_feat, s2_feat, s3_feat], dim=1)
-        fused = self.stripe_fusion(stripe_cat)
-        # Residual connection to preserve the pretrained representation
-        final_feat = global_feat + 0.3 * fused
-        return F.normalize(final_feat, p=2, dim=1)
+        # If BNNeck is present, evaluate with post-BN feature (BoT standard)
+        if hasattr(self, "bnneck") and self.use_bnneck:
+            feat = self.bnneck(feat)
+
+        return F.normalize(feat, p=2, dim=1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        emb = self.extract_features(x)
-        if self.training and self.classifier is not None:
-            logits = self.classifier(emb)
-            return emb, logits
-        return emb, None
+        """
+        Forward pass:
+        - Training: returns (raw_feature_for_triplet, logits_for_ce)
+        - Evaluation: returns (normalized_feature, None)
+        """
+        fm = self.featuremaps(x)
+        v = self.global_avgpool(fm).flatten(1)
+        global_feat = self.fc(v)
+
+        if self.use_stripes:
+            s1 = F.adaptive_avg_pool2d(fm[:, :, 0:5, :], 1).flatten(1)
+            s2 = F.adaptive_avg_pool2d(fm[:, :, 5:11, :], 1).flatten(1)
+            s3 = F.adaptive_avg_pool2d(fm[:, :, 11:16, :], 1).flatten(1)
+            s1_feat = self.stripe1_proj(s1)
+            s2_feat = self.stripe2_proj(s2)
+            s3_feat = self.stripe3_proj(s3)
+            stripe_cat = torch.cat([global_feat, s1_feat, s2_feat, s3_feat], dim=1)
+            fused = self.stripe_fusion(stripe_cat)
+            feat = global_feat + 0.3 * fused
+        else:
+            feat = global_feat
+
+        if not self.training:
+            if hasattr(self, "bnneck") and self.use_bnneck:
+                feat = self.bnneck(feat)
+            return F.normalize(feat, p=2, dim=1), None
+
+        # In training mode with BNNeck
+        if hasattr(self, "bnneck") and self.use_bnneck:
+            feat_bn = self.bnneck(feat)
+        else:
+            feat_bn = feat
+
+        if self.classifier is not None:
+            logits = self.classifier(feat_bn)
+        else:
+            logits = None
+
+        return feat, logits
