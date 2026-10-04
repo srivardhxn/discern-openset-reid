@@ -1,7 +1,7 @@
 """
-Open-set Decision Rule for Look-Alike Re-ID.
-Implements the dual-barrier rejection criteria:
-1. Adaptive similarity barrier: s1 >= tau_i
+Open-set Decision Rule for Look-Alike Person Re-ID.
+Implements modular decision criteria:
+1. Similarity barrier: s1 >= tau (or per-identity tau_i derived from gallery impostors)
 2. Competitive margin barrier: s1 - s2 >= delta
 Returns structured decision and machine-readable rejection codes.
 """
@@ -41,24 +41,29 @@ class DecisionResult:
 
 class OpenSetDecisionEngine:
     """
-    Evaluates query similarity against enrolled prototypes using dual-barrier criteria.
+    Evaluates candidate scores against enrolled prototypes using modular criteria:
+    - Global or per-identity similarity threshold
+    - Competitive margin barrier
     """
     def __init__(
         self,
         default_tau: float = 0.55,
-        default_delta: float = 0.05,
-        use_adaptive_tau: bool = True,
-        use_margin_test: bool = True,
+        default_delta: float = 0.04,
+        use_adaptive_tau: bool = False,
+        use_per_id_threshold: bool = False,
+        use_margin_test: bool = False,
     ):
         self.default_tau = default_tau
         self.default_delta = default_delta
-        self.use_adaptive_tau = use_adaptive_tau
+        self.use_adaptive_tau = use_adaptive_tau or use_per_id_threshold
+        self.use_per_id_threshold = use_per_id_threshold or use_adaptive_tau
         self.use_margin_test = use_margin_test
 
     def evaluate(
         self,
         query_embedding: np.ndarray,
         prototypes: List[IdentityPrototype],
+        candidate_scores: Optional[List[Tuple[IdentityPrototype, float]]] = None,
         target_tau: Optional[float] = None,
         target_delta: Optional[float] = None,
     ) -> DecisionResult:
@@ -77,13 +82,15 @@ class OpenSetDecisionEngine:
                 top_candidates=[],
             )
 
-        # Compute similarity to every enrolled identity prototype
-        scores: List[Tuple[IdentityPrototype, float]] = []
-        for p in prototypes:
-            sim = p.similarity(query_embedding)
-            scores.append((p, sim))
+        if candidate_scores is not None:
+            scores = list(candidate_scores)
+        else:
+            scores = []
+            for p in prototypes:
+                sim = p.similarity(query_embedding)
+                scores.append((p, sim))
 
-        # Sort descending by similarity
+        # Sort descending by score
         scores.sort(key=lambda x: x[1], reverse=True)
 
         top_proto, s1 = scores[0]
@@ -108,16 +115,24 @@ class OpenSetDecisionEngine:
         # Determine threshold tau
         if target_tau is not None:
             tau = target_tau
+        elif self.use_per_id_threshold and hasattr(top_proto, "per_id_tau"):
+            tau = top_proto.per_id_tau
         elif self.use_adaptive_tau and hasattr(top_proto, "adaptive_tau"):
             tau = top_proto.adaptive_tau
         else:
             tau = self.default_tau
 
-        delta = target_delta if target_delta is not None else (self.default_delta if self.use_margin_test else -1.0)
+        # Determine delta
+        if target_delta is not None:
+            delta = target_delta
+        elif self.use_margin_test:
+            delta = self.default_delta
+        else:
+            delta = -1.0  # Margin test disabled
 
-        # Dual-barrier checks
-        passed_tau = (s1 >= tau)
-        passed_margin = (margin >= delta)
+        # Decision checks
+        passed_tau = bool(s1 >= tau)
+        passed_margin = bool(margin >= delta) if (self.use_margin_test or target_delta is not None) else True
 
         if passed_tau and passed_margin:
             decision = "ACCEPTED"

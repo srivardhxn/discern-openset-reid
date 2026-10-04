@@ -323,7 +323,7 @@ export const DemoScenarioModal: React.FC<DemoScenarioModalProps> = ({ isOpen, on
                     <p className="text-[11px] text-[#6B7280] leading-relaxed">
                       {currentStep.is_false_accept_prevented
                         ? `Whitens gallery covariance and requires margin Δ >= ${(currentStep.margin_delta * 100).toFixed(1)}%. Since margin is only ${(currentStep.margin * 100).toFixed(1)}%, impostor is safely refused.`
-                        : `Guarantees strict FAR bound via isotonic calibration and competitive margin delta.`}
+                        : `Enforces calibrated FAR control via isotonic mapping and competitive margin delta.`}
                     </p>
                   </div>
                 </div>

@@ -39,13 +39,10 @@ class FeatureExtractor:
             self.device = torch.device(device)
 
         self.use_stripes = use_stripes
-        self.model = OSNetReID(use_stripes=use_stripes).to(self.device)
-
-        if weights_path and os.path.isfile(weights_path):
-            state_dict = torch.load(weights_path, map_location=self.device)
-            # Filter classifier keys if present
-            filtered_dict = {k: v for k, v in state_dict.items() if not k.startswith("classifier")}
-            self.model.load_state_dict(filtered_dict, strict=False)
+        self.model = OSNetReID(
+            use_stripes=use_stripes,
+            pretrained_path=weights_path if (weights_path and os.path.isfile(weights_path)) else None,
+        ).to(self.device)
 
         self.model.eval()
         self.transform = REID_TRANSFORM

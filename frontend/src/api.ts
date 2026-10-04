@@ -123,14 +123,52 @@ export interface HeadlineMetrics {
 
 export interface AblationRow {
   component: string;
-  full_auroc: number;
+  key?: string;
+  realized_far_1pct: number;
+  realized_far_1pct_std?: number;
+  realized_far_1pct_ci?: [number, number];
   full_tar_1pct: number;
-  full_tar_01pct: number;
+  full_tar_1pct_std?: number;
+  full_tar_1pct_ci?: [number, number];
   full_dir_1pct: number;
-  lowvar_auroc: number;
+  full_dir_1pct_std?: number;
+  full_dir_1pct_ci?: [number, number];
+  full_auroc: number;
+  full_auroc_std?: number;
+  full_auroc_ci?: [number, number];
+  p_value_tar_vs_baseline?: number;
+  p_value_auroc_vs_baseline?: number;
+  lowvar_realized_far_1pct?: number;
   lowvar_tar_1pct: number;
-  lowvar_tar_01pct: number;
+  lowvar_tar_1pct_std?: number;
+  lowvar_tar_1pct_ci?: [number, number];
   lowvar_dir_1pct: number;
+  lowvar_dir_1pct_std?: number;
+  lowvar_dir_1pct_ci?: [number, number];
+  lowvar_auroc: number;
+  lowvar_auroc_std?: number;
+  lowvar_auroc_ci?: [number, number];
+  realized_far_01pct?: number;
+  full_tar_01pct?: number;
+  val_tar_1pct?: number;
+}
+
+export interface UniformStressTest {
+  description: string;
+  baseline: {
+    realized_far: number;
+    tar_1pct: number;
+    tar_1pct_std: number;
+    dir_1pct: number;
+    auroc: number;
+  };
+  discern_default: {
+    realized_far: number;
+    tar_1pct: number;
+    tar_1pct_std: number;
+    dir_1pct: number;
+    auroc: number;
+  };
 }
 
 export interface LookAlikePair {

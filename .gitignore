@@ -68,3 +68,4 @@ Thumbs.db
 !data/sample_market1501/
 !weights/osnet_discern.pth
 !results/
+scratch/

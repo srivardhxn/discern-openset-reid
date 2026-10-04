@@ -1,7 +1,7 @@
 """
 Identity Prototype representation.
 Stores the mean embedding and up to K diverse exemplars per enrolled identity.
-Provides robust multi-instance similarity scoring.
+Provides robust multi-instance similarity scoring and per-identity gallery statistics.
 """
 
 from __future__ import annotations
@@ -15,7 +15,8 @@ class IdentityPrototype:
     Combines:
     1. L2-normalized mean centroid embedding
     2. Up to K diverse exemplar embeddings
-    3. Per-identity adaptive acceptance threshold tau_i
+    3. Per-identity empirical threshold tau_i from gallery impostor similarities
+    4. AS-norm cohort statistics against enrolled gallery
     """
     def __init__(
         self,
@@ -39,10 +40,16 @@ class IdentityPrototype:
         # Select up to K exemplars using diversity sampling (furthest point)
         self.exemplars: np.ndarray = self._select_exemplars(self.raw_embeddings, max_exemplars)
 
-        # Per-identity adaptive threshold (default reasonable value before calibration)
-        self.adaptive_tau: float = 0.65
+        # Per-identity adaptive threshold from gallery impostor distribution
+        self.adaptive_tau: float = 0.55
+        self.per_id_tau: float = 0.55
+        self.gallery_impostor_quantile: float = 0.55
         self.nearest_lookalike_id: Optional[int] = None
         self.nearest_lookalike_sim: float = 0.0
+
+        # AS-norm cohort statistics
+        self.cohort_mean: float = 0.0
+        self.cohort_std: float = 1.0
 
     def _select_exemplars(self, embeddings: np.ndarray, k: int) -> np.ndarray:
         """Selects up to K diverse exemplars."""
@@ -56,7 +63,6 @@ class IdentityPrototype:
 
         selected_indices = [0]
         for _ in range(1, k):
-            # Compute distance to closest selected exemplar for every point
             dist_to_selected = []
             for i in range(n):
                 sims = np.dot(unit_embs[selected_indices], unit_embs[i])
@@ -74,13 +80,11 @@ class IdentityPrototype:
         Computes cosine similarity between query and this identity prototype.
         Combines centroid similarity with best exemplar similarity.
         """
-        # Centroid similarity
         centroid_sim = float(np.dot(query_emb, self.mean_embedding))
 
         if not use_exemplars or len(self.exemplars) == 0:
             return centroid_sim
 
-        # Exemplar similarities
         ex_sims = np.dot(self.exemplars, query_emb)
         max_ex_sim = float(np.max(ex_sims))
 
@@ -95,7 +99,10 @@ class IdentityPrototype:
             "num_samples": len(self.raw_embeddings),
             "num_exemplars": len(self.exemplars),
             "adaptive_tau": round(float(self.adaptive_tau), 4),
+            "per_id_tau": round(float(self.per_id_tau), 4),
             "nearest_lookalike_id": self.nearest_lookalike_id,
             "nearest_lookalike_sim": round(float(self.nearest_lookalike_sim), 4),
+            "cohort_mean": round(float(self.cohort_mean), 4),
+            "cohort_std": round(float(self.cohort_std), 4),
             "image_paths": self.image_paths,
         }

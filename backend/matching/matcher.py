@@ -1,8 +1,14 @@
 """
 Master Discern Open-Set Matcher.
-Orchestrates Gallery-Adaptive Whitening, Multi-Exemplar Identity Prototypes,
-Dual-Barrier Decision Logic, and Calibrated Confidence Scoring.
-All core components have dedicated toggle flags for modular ablation testing.
+Orchestrates:
+1. Multi-Exemplar Identity Prototypes
+2. Per-Identity Threshold tau_i from Gallery Impostor Distribution
+3. AS-Norm (Adaptive Score Normalization)
+4. Competitive Margin Test (s1 - s2 >= delta)
+5. Gallery-Adaptive Whitening
+6. Calibration & Conformal Threshold Selection
+
+All components have dedicated toggle flags for modular ablation testing.
 """
 
 from __future__ import annotations
@@ -40,31 +46,40 @@ class DiscernMatcher:
     """
     def __init__(
         self,
-        use_whitening: bool = True,
+        use_whitening: bool = False,
         use_prototypes: bool = True,
-        use_adaptive_threshold: bool = True,
-        use_margin_test: bool = True,
+        use_per_id_threshold: bool = False,
+        use_as_norm: bool = False,
+        use_margin_test: bool = False,
         use_calibration: bool = True,
+        as_norm_k: int = 10,
         default_tau: float = 0.55,
-        default_delta: float = 0.05,
+        default_delta: float = 0.04,
+        per_id_quantile: float = 0.95,
+        per_id_offset: float = 0.0,
         shrinkage: float = 0.15,
         max_exemplars: int = 4,
     ):
         self.use_whitening = use_whitening
         self.use_prototypes = use_prototypes
-        self.use_adaptive_threshold = use_adaptive_threshold
+        self.use_per_id_threshold = use_per_id_threshold
+        self.use_as_norm = use_as_norm
         self.use_margin_test = use_margin_test
         self.use_calibration = use_calibration
 
+        self.as_norm_k = as_norm_k
         self.default_tau = default_tau
         self.default_delta = default_delta
+        self.per_id_quantile = per_id_quantile
+        self.per_id_offset = per_id_offset
         self.max_exemplars = max_exemplars
 
         self.whitener = GalleryAdaptiveWhitening(shrinkage=shrinkage)
         self.decision_engine = OpenSetDecisionEngine(
             default_tau=default_tau,
             default_delta=default_delta,
-            use_adaptive_tau=use_adaptive_threshold,
+            use_adaptive_tau=use_per_id_threshold,
+            use_per_id_threshold=use_per_id_threshold,
             use_margin_test=use_margin_test,
         )
         self.calibrator = ScoreCalibrator()
@@ -90,7 +105,6 @@ class DiscernMatcher:
         Automatically triggers gallery re-fitting and prototype updates unless recompute=False.
         """
         embs = np.atleast_2d(embeddings).astype(np.float32)
-        # Ensure input embeddings are L2 normalized
         norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-7
         embs = embs / norms
 
@@ -122,7 +136,9 @@ class DiscernMatcher:
 
     def recompute_gallery(self) -> None:
         """
-        Re-fits gallery-adaptive whitening and updates prototypes and per-identity adaptive thresholds.
+        Re-fits gallery-adaptive whitening, builds prototypes, calculates
+        cross-identity gallery impostor distributions for per-identity thresholds,
+        and computes AS-norm cohort statistics.
         """
         self.prototypes.clear()
         if not self._gallery_data:
@@ -158,17 +174,19 @@ class DiscernMatcher:
             )
             self.prototypes[pid] = proto
 
-        # 3. Compute Cross-Identity Look-Alike Relationships and Per-Identity Adaptive Thresholds
+        # 3. Cross-Identity Gallery Impostor Distribution (Per-Identity Threshold tau_i)
         proto_list = list(self.prototypes.values())
         for i, proto_a in enumerate(proto_list):
             max_cross_sim = -1.0
             nearest_lookalike_id = None
+            cross_sims: List[float] = []
 
             for j, proto_b in enumerate(proto_list):
                 if i == j:
                     continue
-                # Centroid cross-similarity
+                # Compute cross-similarity between prototypes
                 sim = float(np.dot(proto_a.mean_embedding, proto_b.mean_embedding))
+                cross_sims.append(sim)
                 if sim > max_cross_sim:
                     max_cross_sim = sim
                     nearest_lookalike_id = proto_b.identity_id
@@ -176,55 +194,149 @@ class DiscernMatcher:
             proto_a.nearest_lookalike_id = nearest_lookalike_id
             proto_a.nearest_lookalike_sim = max(0.0, max_cross_sim)
 
-            # Adaptive threshold tau_i: must be higher than the nearest enrolled competitor
-            # with safety buffer (e.g., nearest_sim + 0.04) or default_tau, whichever is stricter
-            if self.use_adaptive_threshold and nearest_lookalike_id is not None and max_cross_sim > 0.40:
-                proto_a.adaptive_tau = float(np.clip(max_cross_sim + 0.04, self.default_tau, 0.90))
+            if cross_sims:
+                arr_sims = np.array(cross_sims, dtype=np.float32)
+                q_val = float(np.quantile(arr_sims, self.per_id_quantile))
+                proto_a.gallery_impostor_quantile = q_val
+                # tau_i set from quantile + offset (or clamped to reasonable bounds)
+                proto_a.per_id_tau = float(np.clip(q_val + self.per_id_offset, self.default_tau, 0.95))
+                proto_a.adaptive_tau = proto_a.per_id_tau
             else:
+                proto_a.per_id_tau = self.default_tau
                 proto_a.adaptive_tau = self.default_tau
 
-    def match(self, query_embedding: np.ndarray) -> MatchResult:
+            # 4. AS-Norm Enrolled Cohort Statistics
+            if len(cross_sims) > 0:
+                sorted_cohort = sorted(cross_sims, reverse=True)
+                k = min(self.as_norm_k, len(sorted_cohort))
+                proto_a.cohort_mean = float(np.mean(sorted_cohort[:k]))
+                proto_a.cohort_std = float(np.std(sorted_cohort[:k]) + 1e-5)
+            else:
+                proto_a.cohort_mean = 0.0
+                proto_a.cohort_std = 1.0
+
+        # Update decision engine flags
+        self.decision_engine.use_per_id_threshold = self.use_per_id_threshold
+        self.decision_engine.use_adaptive_tau = self.use_per_id_threshold
+        self.decision_engine.use_margin_test = self.use_margin_test
+
+    def compute_scores(self, query_embedding: np.ndarray) -> List[Tuple[IdentityPrototype, float, float]]:
         """
-        Executes open-set match pipeline on a single query embedding:
-        1. Optional Gallery Whitening projection
-        2. Similarity scoring against enrolled prototypes
-        3. Dual-barrier decision rule (s1 >= tau_i AND margin >= delta)
-        4. Calibrated confidence estimation
+        Computes scores for all enrolled identities against a query embedding.
+        Returns list of (prototype, effective_score, raw_similarity).
         """
         q = np.array(query_embedding, dtype=np.float32).flatten()
         norm = np.linalg.norm(q) + 1e-7
         q = q / norm
 
-        # 1. Whitening transform
         if self.use_whitening and self.whitener.is_fitted:
             q_proc = self.whitener.transform(q)
         else:
             q_proc = q
 
-        # 2. Decision rule
-        prototypes_list = list(self.prototypes.values())
-        target_tau = self.calibrator.operating_threshold_tau if (self.use_calibration and self.calibrator.is_fitted) else None
-        target_delta = self.calibrator.operating_margin_delta if (self.use_calibration and self.calibrator.is_fitted) else None
+        prototypes = list(self.prototypes.values())
+        if not prototypes:
+            return []
+
+        # 1. Compute raw prototype similarities
+        raw_sims: List[Tuple[IdentityPrototype, float]] = []
+        for p in prototypes:
+            sim = p.similarity(q_proc, use_exemplars=self.use_prototypes)
+            raw_sims.append((p, float(sim)))
+
+        # 2. Optional AS-Norm (Adaptive Score Normalization)
+        if self.use_as_norm and len(raw_sims) >= 2:
+            sim_values = [s for _, s in raw_sims]
+            sim_values.sort(reverse=True)
+            k = min(self.as_norm_k, len(sim_values))
+            mu_q = float(np.mean(sim_values[:k]))
+            sigma_q = float(np.std(sim_values[:k]) + 1e-5)
+
+            results = []
+            for p, raw_s in raw_sims:
+                norm_probe = (raw_s - mu_q) / sigma_q
+                norm_enroll = (raw_s - p.cohort_mean) / p.cohort_std
+                as_norm_score = 0.5 * (norm_probe + norm_enroll)
+                results.append((p, float(as_norm_score), raw_s))
+            return results
+        else:
+            return [(p, raw_s, raw_s) for p, raw_s in raw_sims]
+
+    def match(
+        self,
+        query_embedding: np.ndarray,
+        target_tau: Optional[float] = None,
+        target_delta: Optional[float] = None,
+    ) -> MatchResult:
+        """
+        Executes open-set match pipeline on a single query embedding:
+        1. Optional Gallery Whitening projection
+        2. Prototype similarity scoring (+ optional AS-norm)
+        3. Decision rule (tau / tau_i and margin delta)
+        4. Calibrated confidence estimation
+        """
+        scores = self.compute_scores(query_embedding)
+        if not scores:
+            return MatchResult(
+                decision="UNKNOWN",
+                predicted_id=None,
+                predicted_name=None,
+                calibrated_confidence=0.01,
+                raw_similarity=0.0,
+                competitor_similarity=0.0,
+                margin=0.0,
+                reason_code="gallery_empty",
+                human_reason="Gallery is empty. Enroll identities first.",
+                top_candidates=[],
+                operating_point={
+                    "alpha": self.calibrator.current_alpha,
+                    "threshold_tau": self.default_tau,
+                    "margin_delta": self.default_delta,
+                },
+            )
+
+        candidate_scores = [(p, eff_s) for p, eff_s, _ in scores]
+        raw_sim_map = {p.identity_id: raw_s for p, _, raw_s in scores}
+
+        # Operating points
+        eff_tau = target_tau
+        if eff_tau is None and self.use_calibration and self.calibrator.is_fitted:
+            eff_tau = self.calibrator.operating_threshold_tau
+
+        eff_delta = target_delta
+        if eff_delta is None and self.use_calibration and self.calibrator.is_fitted:
+            eff_delta = self.calibrator.operating_margin_delta
 
         dec_res = self.decision_engine.evaluate(
-            query_embedding=q_proc,
-            prototypes=prototypes_list,
-            target_tau=target_tau,
-            target_delta=target_delta,
+            query_embedding=query_embedding,
+            prototypes=list(self.prototypes.values()),
+            candidate_scores=candidate_scores,
+            target_tau=eff_tau,
+            target_delta=eff_delta,
         )
 
-        # 3. Calibrated Confidence
-        if self.use_calibration:
-            fused_score = dec_res.s1 + 0.5 * dec_res.margin
-            confidence = self.calibrator.predict_confidence(fused_score)
+        # Calibrated Confidence
+        if self.use_calibration and self.calibrator.is_fitted:
+            confidence = self.calibrator.predict_confidence(dec_res.s1)
+        elif self.use_calibration:
+            confidence = self.calibrator.predict_confidence(dec_res.s1)
         else:
-            confidence = float(np.clip(dec_res.s1, 0.0, 1.0))
+            confidence = float(np.clip(dec_res.s1, 0.01, 0.99))
 
         op_point = {
             "alpha": self.calibrator.current_alpha,
             "threshold_tau": dec_res.threshold_tau,
             "margin_delta": dec_res.margin_delta,
         }
+
+        # Candidate details with both raw and effective similarities
+        top_candidates = []
+        for cand in dec_res.top_candidates:
+            cid = cand["identity_id"]
+            cand_dict = dict(cand)
+            cand_dict["effective_score"] = cand["similarity"]
+            cand_dict["raw_similarity"] = raw_sim_map.get(cid, cand["similarity"])
+            top_candidates.append(cand_dict)
 
         return MatchResult(
             decision=dec_res.decision,
@@ -236,7 +348,7 @@ class DiscernMatcher:
             margin=dec_res.margin,
             reason_code=dec_res.reason_code,
             human_reason=dec_res.human_reason,
-            top_candidates=dec_res.top_candidates,
+            top_candidates=top_candidates,
             operating_point=op_point,
         )
 

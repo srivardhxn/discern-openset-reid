@@ -61,14 +61,16 @@ class ScoreCalibrator:
         """
         self.current_alpha = float(alpha)
 
-        if not self.val_impostor_scores:
-            # Heuristic reasonable values
-            tau = 0.60 + 0.15 * (1.0 - np.clip(alpha, 0.001, 0.1))
-            self.operating_threshold_tau = float(tau)
-            self.operating_margin_delta = 0.05
+        if len(self.val_impostor_scores) < 100:
+            # Anchored to validated operating point (tau=0.55, delta=0.04 at alpha=0.01)
+            ratio = np.clip(alpha / 0.01, 0.05, 5.0)
+            tau = 0.55 - 0.08 * np.log10(ratio)
+            self.operating_threshold_tau = round(float(np.clip(tau, 0.45, 0.80)), 4)
+            delta = 0.04 - 0.015 * np.log10(ratio)
+            self.operating_margin_delta = round(float(np.clip(delta, 0.02, 0.08)), 4)
             return {
                 "alpha": self.current_alpha,
-                "threshold_tau": round(self.operating_threshold_tau, 4),
+                "threshold_tau": self.operating_threshold_tau,
                 "margin_delta": self.operating_margin_delta,
                 "calibrated_tar": None,
                 "calibrated_far": self.current_alpha,

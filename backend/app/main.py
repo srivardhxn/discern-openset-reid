@@ -76,13 +76,14 @@ def init_engine():
     print("[INFO] Initializing Feature Extractor & Matcher Engine...")
     extractor = FeatureExtractor(weights_path=WEIGHTS_PATH if os.path.isfile(WEIGHTS_PATH) else None)
     matcher = DiscernMatcher(
-        use_whitening=True,
+        use_whitening=False,
         use_prototypes=True,
-        use_adaptive_threshold=True,
+        use_per_id_threshold=False,
+        use_as_norm=False,
         use_margin_test=True,
         use_calibration=True,
         default_tau=0.55,
-        default_delta=0.05,
+        default_delta=0.04,
     )
 
     # Pre-populate gallery with benchmark enrolled identities if split exists
@@ -123,6 +124,22 @@ def init_engine():
                 g_scores = [matcher.match(e).raw_similarity for e in g_embs]
                 i_scores = [matcher.match(e).raw_similarity for e in i_embs]
                 matcher.calibrator.fit(g_scores, i_scores)
+
+            # Ensure operating thresholds reflect the validated production configuration
+            eval_path = os.path.join(RESULTS_DIR, "evaluation_results.json")
+            if os.path.isfile(eval_path):
+                try:
+                    with open(eval_path, "r", encoding="utf-8") as ef:
+                        eval_data = json.load(ef)
+                    default_cfg = eval_data.get("default_configuration", {})
+                    d_tau = default_cfg.get("default_tau", 0.55)
+                    d_delta = default_cfg.get("default_delta", 0.04)
+                    matcher.decision_engine.default_tau = d_tau
+                    matcher.decision_engine.default_delta = d_delta
+                    matcher.calibrator.operating_threshold_tau = d_tau
+                    matcher.calibrator.operating_margin_delta = d_delta
+                except Exception as ex:
+                    print(f"[WARN] Failed to load default_configuration: {ex}")
 
             print(f"[OK] Pre-enrolled {matcher.get_enrolled_count()} benchmark identities into gallery.")
         except Exception as e:
@@ -550,6 +567,8 @@ def get_metrics():
         "status": "ready",
         "headline_metrics": data.get("headline_metrics"),
         "metadata": data.get("metadata"),
+        "default_configuration": data.get("default_configuration"),
+        "uniform_stress_test": data.get("uniform_stress_test"),
         "latency_and_parameters": data.get("latency_and_parameters"),
         "analysis_paragraph": data.get("analysis_paragraph"),
     }
