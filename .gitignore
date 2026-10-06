@@ -1,62 +1,27 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
+# Environments & Dependencies
 .venv/
-ENV/
-build/
-develop-eggs/
+node_modules/
+frontend/node_modules/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+build/
+frontend/dist/
+frontend/.vite/
 
-# Testing & Coverage
+# Python bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 .pytest_cache/
 .coverage
 htmlcov/
-.tox/
-.nox/
 
-# Node & Frontend
-node_modules/
-frontend/node_modules/
-frontend/dist/
-frontend/.vite/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+# Secrets & Credentials
+.env
+*.env
+kaggle.json
 
-# User uploads & ephemeral session data
-data/uploads/*
-!data/uploads/.gitkeep
-
-# External / Full raw datasets (download instructions in data/README.md)
-data/Market-1501-v15.09.15/
-data/cuhk03/
-data/dukemtmc-reid/
-data/msmt17/
-data/viper/
-data/grid/
-data/ilids/
-*.zip
-*.tar.gz
-*.tar
-
-# OS & IDE
+# OS & Editor
 .DS_Store
 Thumbs.db
 .vscode/
@@ -64,11 +29,26 @@ Thumbs.db
 *.swp
 *.swo
 
-# Project specific: Keep lightweight sample data and trained weights
-!data/sample_market1501/
-!weights/osnet_discern.pth
-!results/
-scratch/
+# Datasets (Market-1501 is a research dataset, images not redistributed in repo)
+data/Market-1501*/
+data/sample_market1501/
+data/cuhk03/
+data/dukemtmc-reid/
+data/msmt17/
+data/viper/
+data/grid/
+data/ilids/
+data/uploads/*
+!data/uploads/.gitkeep
 
-# PyTorch large model checkpoints (>100MB exceed GitHub push limits; backend runs on ONNX)
+# Model weights & TorchScript (>100MB; backend runs on ONNX)
+model/discern_reid_r50.pt
+model/discern_embedder.torchscript.pt
+model/__pycache__/
 *.pt
+
+# Archives & Scratch
+*.zip
+*.tar.gz
+*.tar
+scratch/
