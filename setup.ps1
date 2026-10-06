@@ -43,9 +43,13 @@ Push-Location (Join-Path $ScriptDir "frontend")
 cmd.exe /c npm install
 Pop-Location
 
-# 5. Prepare data and curate low-variance subset
-Write-Host "`n[5/5] Preparing dataset and low-variance subset..." -ForegroundColor Yellow
-& ".\.venv\Scripts\python.exe" scripts\prepare_data.py
+# 5. Verify model bundle
+Write-Host "`n[5/5] Verifying Discern ONNX model bundle..." -ForegroundColor Yellow
+if (Test-Path "model\discern_embedder.onnx") {
+    Write-Host "Model bundle verified at .\model\" -ForegroundColor Green
+} else {
+    Write-Warning "Model bundle not found at .\model\"
+}
 
 Write-Host "`n============================================================" -ForegroundColor Green
 Write-Host " DISCERN Setup Completed Successfully!" -ForegroundColor Green

@@ -38,7 +38,7 @@ from PIL import Image
 # Paths
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[2]       # …/discern/
-MODEL_DIR    = PROJECT_ROOT / "models" / "discern_model"
+MODEL_DIR    = PROJECT_ROOT / "model"
 DEMO_DIR     = MODEL_DIR / "demo"
 SAMPLES_DIR  = MODEL_DIR / "samples"
 REPORTS_DIR  = MODEL_DIR / "reports"
@@ -178,6 +178,8 @@ async def identify(
     t0 = time.perf_counter()
     result = _model.identify(img, op=op)
     result["inference_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    if result["decision"] != "accept":
+        result["identity"] = "UNKNOWN"
     result["display_decision"] = "ACCEPTED" if result["decision"] == "accept" else "UNKNOWN"
     return result
 
