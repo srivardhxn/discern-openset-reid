@@ -34,6 +34,13 @@ Open two PowerShell terminals:
 ```
 *Web dashboard launches on [http://localhost:5173](http://localhost:5173).*
 
+### Verification Smoke Test
+To verify the end-to-end ONNX inference pipeline, model loading, and decision logic via CLI:
+```bash
+python scripts/smoke_test.py
+```
+*Loads the demo gallery and runs all probe images through `models/discern_model/discern_embedder.onnx`, verifying accuracy, latency, and false accept rejection.*
+
 ---
 
 ## 2. Training (Single T4 GPU / Kaggle / Colab)
@@ -101,6 +108,29 @@ To allow reviewers to compare directly with published Re-ID literature, we repor
 | **Model 4: + Horizontal Stripes** | Fine-Tuned (ArcFace + Stripes + Mining) | **55.56%** | **79.28%** | **48.01%** |
 
 *Note: Pretrained weights verify that the backbone feature extractor is functioning as expected (>50% zero-shot Rank-1). Fine-tuning Model 1 on Market-1501 lifts closed-set Rank-1 to 61.86% and mAP to 53.25%.*
+
+### Production Deployment Model (PS-1 ONNX Bundle)
+The primary deployment model (`models/discern_model/discern_embedder.onnx`) is an L2-normalized 2048-dimensional feature extractor with horizontal flip-TTA and calibrated open-set decision thresholds:
+
+- **Closed-Set Market-1501**: **mAP 86.3%**, **Rank-1 94.2%** (single-query, flip-TTA, no re-ranking).
+- **Held-Out Calibration**: **ECE 0.014** (Expected Calibration Error).
+- **Target Operating Points** (Calibrator `s1_margin_z`, pooled open-set protocol):
+
+| Operating Point | Threshold ($\tau$) | Target FAR | False Accept Rate | Look-Alike (LV90) False Accept | True Accept Rate |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Strict** | 0.998 | 0.1% | 0.10% | 0.82% | 8.8% |
+| **Balanced** | 0.963 | 1.0% | 0.99% | 5.46% | 51.4% |
+| **Lenient** | 0.651 | 5.0% | 5.00% | 13.20% | 82.7% |
+
+#### Visual Evaluation & Reliability
+
+| Open-Set ROC & Ablation Curves | Look-Alike Confusable Pairs (Market-1501) |
+| :---: | :---: |
+| ![Open-Set ROC](models/discern_model/reports/open_set_roc_ablation.png) | ![Look-Alike Pairs](models/discern_model/reports/lookalike_pairs.png) |
+
+| Score Calibration & Reliability (ECE 0.014) | Training Convergence & Loss Curves |
+| :---: | :---: |
+| ![Calibration Reliability](models/discern_model/reports/calibration_reliability.png) | ![Training Curves](models/discern_model/reports/training_curves.png) |
 
 ### Honest Out-of-Sample Open-Set Evaluation Protocol
 To guarantee that no evaluation numbers suffer from test data leakage:

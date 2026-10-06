@@ -1,51 +1,65 @@
 """
-FastAPI Backend for Discern Open-Set Re-Identification.
-Provides endpoints for:
-- POST /enroll (images + name)
-- POST /match (image file or base64 -> decision, calibrated confidence, top-3 candidates, margin, reason)
-- GET /gallery
-- DELETE /identity/{id}
-- PUT /operating-point (alpha)
-- GET /metrics
-- GET /roc
-- GET /ablation
-- GET /lookalikes
-- Static file serving for crops and ROC charts
-- Input validation, clear errors, and permissive CORS
+FastAPI backend for Discern Open-Set Re-ID (PS-1 ONNX model bundle).
+
+Wraps models/discern_model/discern_inference.py (ONNX, GPU if available).
+All decision math is delegated to Discern.identify() -- no reimplementation.
+
+Endpoints
+---------
+POST   /api/enroll            identity: str, images: UploadFile[]
+POST   /api/identify          image: UploadFile, op: strict|balanced|lenient
+DELETE /api/identity/{id}
+GET    /api/gallery
+GET    /api/config            decision_config.json
+GET    /api/lookalikes        lookalike_explorer.json (+ full image URLs)
+GET    /api/metrics           reports/eval_report.json
+GET    /api/metrics/images    URLs for ROC/ablation PNGs
+POST   /api/demo/load         loads demo_manifest.json + demo_embeddings.npz
+GET    /api/demo/status
+POST   /api/demo/smoke-test   runs probes, returns accepted/FA counts
 """
 
 from __future__ import annotations
-import os
+
 import io
-import sys
 import json
-import base64
-import uuid
-import shutil
+import sys
 import time
+from pathlib import Path
+from typing import List, Optional
+
 import numpy as np
-from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Body, Request
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 from PIL import Image
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[2]       # …/discern/
+MODEL_DIR    = PROJECT_ROOT / "models" / "discern_model"
+DEMO_DIR     = MODEL_DIR / "demo"
+SAMPLES_DIR  = MODEL_DIR / "samples"
+REPORTS_DIR  = MODEL_DIR / "reports"
 
-from backend.models.extractor import FeatureExtractor
-from backend.matching.matcher import DiscernMatcher
-from backend.data.dataset import ReIDSample
+# Inject model dir so Python can find discern_inference.py
+if str(MODEL_DIR) not in sys.path:
+    sys.path.insert(0, str(MODEL_DIR))
 
-app = FastAPI(
-    title="Discern Open-Set Re-ID API",
-    description="Minimizes false accepts under low inter-class appearance variance (uniform look-alikes).",
-    version="1.0.0",
-)
+from discern_inference import Discern  # noqa: E402
 
-# Enable CORS for local Vite frontend
+# ---------------------------------------------------------------------------
+# Boot model (GPU auto-selected)
+# ---------------------------------------------------------------------------
+_model = Discern(str(MODEL_DIR))
+print("[Discern] Providers:", _model.sess.get_providers())
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+app = FastAPI(title="Discern ONNX Re-ID API", version="2.0.0")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -54,616 +68,363 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Directories
-WEIGHTS_PATH = os.path.join(PROJECT_ROOT, "weights", "osnet_discern.pth")
-RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
-os.makedirs(UPLOADS_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
+# Static files
+app.mount("/static/samples",     StaticFiles(directory=str(SAMPLES_DIR)),          name="samples")
+app.mount("/static/demo/images", StaticFiles(directory=str(DEMO_DIR / "images")),  name="demo_images")
+app.mount("/static/reports",     StaticFiles(directory=str(REPORTS_DIR)),          name="reports")
 
-# Mount static files so UI can preview probe images, crops, and charts
-app.mount("/static/data", StaticFiles(directory=DATA_DIR), name="static_data")
-app.mount("/static/results", StaticFiles(directory=RESULTS_DIR), name="static_results")
-
-# Global model and matcher instances
-extractor: Optional[FeatureExtractor] = None
-matcher: Optional[DiscernMatcher] = None
+# ---------------------------------------------------------------------------
+# Demo state
+# ---------------------------------------------------------------------------
+_demo_loaded: bool = False
 
 
-def init_engine():
-    global extractor, matcher
-    print("[INFO] Initializing Feature Extractor & Matcher Engine...")
-    extractor = FeatureExtractor(weights_path=WEIGHTS_PATH if os.path.isfile(WEIGHTS_PATH) else None)
-    matcher = DiscernMatcher(
-        use_whitening=False,
-        use_prototypes=True,
-        use_per_id_threshold=False,
-        use_as_norm=False,
-        use_margin_test=True,
-        use_calibration=True,
-        default_tau=0.55,
-        default_delta=0.04,
-    )
-
-    # Pre-populate gallery with benchmark enrolled identities if split exists
-    split_path = os.path.join(RESULTS_DIR, "open_set_split.json")
-    if os.path.isfile(split_path):
-        try:
-            with open(split_path, "r", encoding="utf-8") as f:
-                split_dict = json.load(f)
-            gallery_samples = [ReIDSample(**s) for s in split_dict.get("gallery_samples", [])]
-
-            valid_samples = [s for s in gallery_samples if os.path.isfile(s.image_path)]
-            if valid_samples:
-                all_paths = [s.image_path for s in valid_samples]
-                all_embs = extractor.extract_batch(all_paths, batch_size=32)
-                id_to_embs = {}
-                id_to_paths = {}
-                for idx, s in enumerate(valid_samples):
-                    id_to_embs.setdefault(s.identity_id, []).append(all_embs[idx])
-                    id_to_paths.setdefault(s.identity_id, []).append(s.image_path)
-
-                for pid, embs in id_to_embs.items():
-                    matcher.enroll(
-                        identity_id=pid,
-                        name=f"Identity {pid}",
-                        embeddings=np.array(embs),
-                        image_paths=id_to_paths[pid],
-                        recompute=False,
-                    )
-                matcher.recompute_gallery()
-
-            # Fit calibrator using genuine and impostor validation scores
-            gen_samples = [s["image_path"] for s in split_dict.get("val_genuine_probes", split_dict.get("genuine_probe_samples", [])) if os.path.isfile(s["image_path"])]
-            imp_samples = [s["image_path"] for s in split_dict.get("val_impostor_probes", split_dict.get("impostor_probe_samples", [])) if os.path.isfile(s["image_path"])]
-
-            if gen_samples and imp_samples:
-                g_embs = extractor.extract_batch(gen_samples[:32], batch_size=32)
-                i_embs = extractor.extract_batch(imp_samples[:32], batch_size=32)
-                g_scores = [matcher.match(e).raw_similarity for e in g_embs]
-                i_scores = [matcher.match(e).raw_similarity for e in i_embs]
-                matcher.calibrator.fit(g_scores, i_scores)
-
-            # Ensure operating thresholds reflect the validated production configuration
-            eval_path = os.path.join(RESULTS_DIR, "evaluation_results.json")
-            if os.path.isfile(eval_path):
-                try:
-                    with open(eval_path, "r", encoding="utf-8") as ef:
-                        eval_data = json.load(ef)
-                    default_cfg = eval_data.get("default_configuration", {})
-                    d_tau = default_cfg.get("default_tau", 0.55)
-                    d_delta = default_cfg.get("default_delta", 0.04)
-                    matcher.decision_engine.default_tau = d_tau
-                    matcher.decision_engine.default_delta = d_delta
-                    matcher.calibrator.operating_threshold_tau = d_tau
-                    matcher.calibrator.operating_margin_delta = d_delta
-                except Exception as ex:
-                    print(f"[WARN] Failed to load default_configuration: {ex}")
-
-            print(f"[OK] Pre-enrolled {matcher.get_enrolled_count()} benchmark identities into gallery.")
-        except Exception as e:
-            print(f"[WARN] Failed to pre-populate gallery: {e}")
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _pil(upload: UploadFile) -> Image.Image:
+    data = upload.file.read()
+    if not data:
+        raise HTTPException(400, "Uploaded file is empty.")
+    try:
+        return Image.open(io.BytesIO(data)).convert("RGB")
+    except Exception:
+        raise HTTPException(400, "File is not a readable image.")
 
 
-@app.on_event("startup")
-def startup_event():
-    init_engine()
+def _validate(img: Image.Image, name: str = "image") -> None:
+    if float(np.std(np.array(img))) < 3.0:
+        raise HTTPException(400, f"{name} is blank (insufficient visual variance).")
 
 
-# Pydantic Schemas
-class OperatingPointUpdate(BaseModel):
-    alpha: float = Field(..., ge=0.0001, le=0.5, description="Target False Accept Rate, e.g. 0.01 for 1%")
-
-
-class MatchBase64Request(BaseModel):
-    image_base64: str = Field(..., description="Base64 encoded image string (JPEG/PNG)")
-
-
+# ---------------------------------------------------------------------------
+# Root
+# ---------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {
         "status": "online",
-        "service": "Discern Open-Set Re-Identification API",
-        "version": "1.0.0",
-        "enrolled_identities": matcher.get_enrolled_count() if matcher else 0,
-        "operating_point": {
-            "alpha": matcher.calibrator.current_alpha if matcher else 0.01,
-            "threshold_tau": matcher.calibrator.operating_threshold_tau if matcher else 0.60,
-            "margin_delta": matcher.calibrator.operating_margin_delta if matcher else 0.05,
-        } if matcher else {},
+        "model": _model.cfg["model"]["name"],
+        "providers": _model.sess.get_providers(),
+        "enrolled": len(_model.rows),
+        "default_op": _model.cfg["default_operating_point"],
     }
 
 
-@app.get("/gallery")
+# ---------------------------------------------------------------------------
+# Gallery
+# ---------------------------------------------------------------------------
+@app.get("/api/gallery")
 def get_gallery():
-    """Returns all enrolled identities in the gallery."""
-    if not matcher:
-        return []
-    gallery = matcher.get_gallery_summary()
-    # Normalize paths to URL accessible endpoints
-    for item in gallery:
-        norm_urls = []
-        for p in item.get("image_paths", []):
-            rel = os.path.relpath(p, PROJECT_ROOT).replace("\\", "/")
-            norm_urls.append(f"/static/{rel}")
-        item["image_urls"] = norm_urls
-    return gallery
-
-
-@app.post("/enroll")
-async def enroll_identity(
-    name: str = Form(...),
-    files: List[UploadFile] = File(...),
-):
-    """Enrolls a new identity into the open-set gallery."""
-    global matcher, extractor
-    if not matcher or not extractor:
-        raise HTTPException(status_code=500, detail="Matching engine is not initialized")
-
-    clean_name = name.strip()
-    if not clean_name:
-        raise HTTPException(status_code=400, detail="Identity name cannot be empty")
-
-    # Check for duplicate name
-    existing_names = [p.name.strip().lower() for p in matcher.prototypes.values()]
-    if clean_name.lower() in existing_names:
-        raise HTTPException(status_code=400, detail=f"Identity '{clean_name}' is already enrolled in the gallery.")
-
-    if not files:
-        raise HTTPException(status_code=400, detail="At least one image must be provided")
-
-    MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
-
-    # Validate each file before creating folder or saving
-    validated_images = []
-    for file in files:
-        contents = await file.read()
-        if len(contents) == 0:
-            raise HTTPException(status_code=400, detail=f"File '{file.filename}' is empty (0 bytes).")
-        if len(contents) > MAX_FILE_BYTES:
-            raise HTTPException(status_code=400, detail=f"File '{file.filename}' exceeds maximum allowed size (10MB).")
-
-        try:
-            img = Image.open(io.BytesIO(contents)).convert("RGB")
-        except Exception:
-            raise HTTPException(status_code=400, detail=f"File '{file.filename}' is not a valid or readable image.")
-
-        # Check visual variance (reject completely blank / solid color / non-person crops)
-        img_arr = np.array(img)
-        if float(np.std(img_arr)) < 3.0:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Image '{file.filename}' is blank or contains no subject (insufficient visual variance)."
-            )
-
-        # Scale down very large dimension images smoothly
-        if img.width > 2048 or img.height > 2048:
-            img.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
-
-        validated_images.append((file.filename, img))
-
-    # Generate a unique identity ID (positive integer)
-    existing_ids = list(matcher.prototypes.keys())
-    new_id = (max(existing_ids) + 1) if existing_ids else 1
-
-    id_folder = os.path.join(UPLOADS_DIR, f"id_{new_id}_{uuid.uuid4().hex[:6]}")
-    os.makedirs(id_folder, exist_ok=True)
-
-    saved_paths = []
-    try:
-        for idx, (orig_filename, img) in enumerate(validated_images):
-            save_path = os.path.join(id_folder, f"{uuid.uuid4().hex[:8]}.jpg")
-            img.save(save_path, "JPEG", quality=95)
-            saved_paths.append(save_path)
-
-        # Extract embeddings and enroll
-        embeddings = extractor.extract_batch(saved_paths)
-        proto = matcher.enroll(
-            identity_id=new_id,
-            name=clean_name,
-            embeddings=embeddings,
-            image_paths=saved_paths,
-        )
-    except Exception as e:
-        shutil.rmtree(id_folder, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"Feature extraction failed: {str(e)}")
-
-    proto_dict = proto.to_dict()
-    proto_dict["image_urls"] = [
-        f"/static/{os.path.relpath(p, PROJECT_ROOT).replace('\\', '/')}" for p in saved_paths
+    """Return summary of all enrolled identities."""
+    return [
+        {"identity": name, "num_embeddings": len(rows)}
+        for name, rows in _model.rows.items()
     ]
+
+
+# ---------------------------------------------------------------------------
+# Enroll
+# ---------------------------------------------------------------------------
+@app.post("/api/enroll")
+async def enroll(
+    identity: str = Form(...),
+    images: List[UploadFile] = File(...),
+):
+    """Enroll one or more person crops under a named identity."""
+    identity = identity.strip()
+    if not identity:
+        raise HTTPException(400, "Identity name cannot be empty.")
+    if not images:
+        raise HTTPException(400, "At least one image is required.")
+
+    pils: List[Image.Image] = []
+    for up in images:
+        img = _pil(up)
+        _validate(img, up.filename or "image")
+        pils.append(img)
+
+    _model.enroll(identity, pils)
     return {
-        "status": "success",
-        "message": f"Successfully enrolled '{clean_name}' with {len(saved_paths)} images.",
-        "identity": proto_dict,
+        "status": "enrolled",
+        "identity": identity,
+        "images_added": len(pils),
+        "total_enrolled": len(_model.rows),
     }
 
 
-@app.delete("/identity/{identity_id}")
-@app.delete("/gallery/{identity_id}")
-def delete_identity(identity_id: int):
-    """Removes an identity from the enrolled gallery and re-fits whitening & prototypes."""
-    global matcher
-    if not matcher:
-        raise HTTPException(status_code=500, detail="Matching engine not initialized")
-
-    if identity_id not in matcher._gallery_data:
-        raise HTTPException(status_code=404, detail=f"Identity {identity_id} not found in gallery")
-
-    success = matcher.delete(identity_id)
-    return {
-        "status": "success" if success else "failed",
-        "deleted_identity_id": identity_id,
-        "remaining_gallery_size": matcher.get_enrolled_count(),
-    }
-
-
-@app.post("/match")
-async def match_probe(
-    request: Request,
-    file: Optional[UploadFile] = File(None),
+# ---------------------------------------------------------------------------
+# Identify
+# ---------------------------------------------------------------------------
+@app.post("/api/identify")
+async def identify(
+    image: UploadFile = File(...),
+    op: Optional[str] = Form(None),
 ):
     """
-    Evaluates a probe image against the gallery using Discern's open-set decision engine.
-    Accepts multipart file upload OR base64 payload (from webcam frame).
+    Identify a probe against the enrolled gallery.
+    op: strict | balanced | lenient  (default from decision_config.json)
+    Always returns decision='reject'/display_decision='UNKNOWN' when rejected.
+    Never forces a match.
     """
-    global matcher, extractor
-    if not matcher or not extractor:
-        raise HTTPException(status_code=500, detail="Matching engine not initialized")
+    if op and op not in ("strict", "balanced", "lenient"):
+        raise HTTPException(400, "op must be strict, balanced, or lenient")
+    if not _model.rows:
+        raise HTTPException(400, "Gallery empty. Load demo or enroll identities.")
 
-    if matcher.get_enrolled_count() == 0:
-        raise HTTPException(status_code=400, detail="Gallery is empty. Please enroll identities first.")
+    img = _pil(image)
+    _validate(img)
 
-    # Obtain PIL Image
-    pil_img: Optional[Image.Image] = None
-    content_type = request.headers.get("content-type", "")
+    t0 = time.perf_counter()
+    result = _model.identify(img, op=op)
+    result["inference_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    result["display_decision"] = "ACCEPTED" if result["decision"] == "accept" else "UNKNOWN"
+    return result
 
-    if "application/json" in content_type:
-        try:
-            body = await request.json()
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        image_b64 = body.get("image_base64")
-        if not image_b64:
-            raise HTTPException(status_code=400, detail="No image provided (upload a file or send image_base64)")
-        try:
-            header_split = image_b64.split(",")
-            base64_data = header_split[-1]
-            decoded = base64.b64decode(base64_data)
-            pil_img = Image.open(io.BytesIO(decoded)).convert("RGB")
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid base64 image data.")
-    elif file is not None:
-        contents = await file.read()
-        if len(contents) == 0:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty (0 bytes).")
-        if len(contents) > 15 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="Probe image exceeds maximum allowed size (15MB).")
-        try:
-            pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
-        except Exception:
-            raise HTTPException(status_code=400, detail="Uploaded file is not a valid or readable image.")
-    else:
-        raise HTTPException(status_code=400, detail="No image provided (upload a file or send image_base64)")
 
-    # Check for empty / zero-variance image
-    img_arr = np.array(pil_img)
-    if float(np.std(img_arr)) < 3.0:
-        raise HTTPException(
-            status_code=400,
-            detail="Probe image is blank or contains no subject (insufficient visual variance)."
-        )
+# ---------------------------------------------------------------------------
+# Delete identity
+# ---------------------------------------------------------------------------
+@app.delete("/api/identity/{identity_id}")
+def delete_identity(identity_id: str):
+    """Remove an identity from the gallery (rebuilds embedding matrix)."""
+    if identity_id not in _model.rows:
+        raise HTTPException(404, f"Identity {identity_id!r} not found in gallery.")
+    _model.remove(identity_id)
+    return {"status": "deleted", "identity": identity_id, "remaining": len(_model.rows)}
 
-    t_start = time.perf_counter()
-    try:
-        query_emb = extractor.extract(pil_img)
-        match_res = matcher.match(query_emb)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Matching pipeline failed: {str(e)}")
-    t_end = time.perf_counter()
-    elapsed_ms = round((t_end - t_start) * 1000.0, 1)
 
-    res_dict = match_res.to_dict()
-    res_dict["inference_time_ms"] = elapsed_ms
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+@app.get("/api/config")
+def get_config():
+    """Return the full decision_config.json as JSON."""
+    return _model.cfg
 
-    # Baseline plain cosine threshold comparison (standard fixed threshold = 0.70)
-    top_cand = res_dict["top_candidates"][0] if res_dict.get("top_candidates") else None
-    baseline_th = 0.70
-    baseline_accepted = (res_dict["raw_similarity"] >= baseline_th) and (top_cand is not None)
-    is_false_accept = baseline_accepted and (match_res.decision == "UNKNOWN")
 
-    res_dict["baseline_comparison"] = {
-        "decision": "ACCEPTED" if baseline_accepted else "UNKNOWN",
-        "predicted_id": top_cand["identity_id"] if baseline_accepted else None,
-        "predicted_name": top_cand["name"] if baseline_accepted else None,
-        "similarity": res_dict["raw_similarity"],
-        "threshold": baseline_th,
-        "is_false_accept": is_false_accept,
-        "explanation": (
-            f"Plain cosine accepts at similarity {res_dict['raw_similarity']:.3f} >= {baseline_th:.2f}, "
-            "failing to detect competitor ambiguity!"
-            if is_false_accept
-            else (
-                f"Accepted under threshold {baseline_th:.2f}"
-                if baseline_accepted
-                else f"Rejected: similarity {res_dict['raw_similarity']:.3f} < {baseline_th:.2f}"
-            )
-        ),
+# ---------------------------------------------------------------------------
+# Lookalikes
+# ---------------------------------------------------------------------------
+@app.get("/api/lookalikes")
+def get_lookalikes():
+    """Return lookalike_explorer.json with full image URLs attached."""
+    p = MODEL_DIR / "lookalike_explorer.json"
+    if not p.exists():
+        raise HTTPException(404, "lookalike_explorer.json not found.")
+    data = json.loads(p.read_text())
+    for pair in data.get("pairs", []):
+        for field in ("image_a", "image_b", "genuine_image_1", "genuine_image_2"):
+            raw: Optional[str] = pair.get(field)
+            if raw:
+                pair[f"{field}_url"] = "/static/samples/" + Path(raw).name
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+@app.get("/api/metrics")
+def get_metrics():
+    """Return reports/eval_report.json."""
+    p = REPORTS_DIR / "eval_report.json"
+    if not p.exists():
+        raise HTTPException(404, "eval_report.json not found.")
+    return json.loads(p.read_text())
+
+
+@app.get("/api/metrics/images")
+def get_metric_images():
+    """Return static URLs for report PNG images."""
+    fmap = {
+        "roc_ablation":    "open_set_roc_ablation.png",
+        "calibration":     "calibration_reliability.png",
+        "training_curves": "training_curves.png",
+        "lookalike_pairs": "lookalike_pairs.png",
+    }
+    return {
+        k: "/static/reports/" + f
+        for k, f in fmap.items()
+        if (REPORTS_DIR / f).exists()
     }
 
-    # Enrich top candidates with sample thumbnail URLs
-    for cand in res_dict.get("top_candidates", []):
-        cid = cand["identity_id"]
-        proto = matcher.prototypes.get(cid)
-        if proto and proto.image_paths:
-            cand["thumbnail_url"] = f"/static/{os.path.relpath(proto.image_paths[0], PROJECT_ROOT).replace('\\', '/')}"
+
+@app.get("/api/metrics/ablation-inference")
+def ablation_inference():
+    p = REPORTS_DIR / "ablation_inference.md"
+    return {"content": p.read_text() if p.exists() else ""}
+
+
+@app.get("/api/metrics/ablation-training")
+def ablation_training():
+    p = REPORTS_DIR / "ablation_training.md"
+    return {"content": p.read_text() if p.exists() else ""}
+
+
+# ---------------------------------------------------------------------------
+# Demo load
+# ---------------------------------------------------------------------------
+@app.post("/api/demo/load")
+def demo_load():
+    """
+    Load the bundled demo gallery.
+    Uses pre-computed demo_embeddings.npz (fast) if available,
+    otherwise embeds gallery images on the fly.
+    Clears any existing gallery first.
+    """
+    global _demo_loaded
+    manifest_p = DEMO_DIR / "demo_manifest.json"
+    emb_p      = DEMO_DIR / "demo_embeddings.npz"
+    if not manifest_p.exists():
+        raise HTTPException(404, "demo_manifest.json not found.")
+
+    manifest = json.loads(manifest_p.read_text())
+
+    # Reset gallery
+    _model.rows.clear()
+    _model.emb = np.zeros((0, _model.cfg["model"]["embedding_dim"]), np.float32)
+
+    if emb_p.exists():
+        npz = np.load(str(emb_p))
+        if "gallery" in npz and len(manifest.get("gallery", [])) == len(npz["gallery"]):
+            for i, entry in enumerate(manifest["gallery"]):
+                emb = npz["gallery"][i : i + 1].astype(np.float32)
+                _model.add_embeddings(entry["identity"], emb)
+            via = "pre-computed embeddings"
         else:
-            cand["thumbnail_url"] = None
+            for key in npz.files:
+                emb = npz[key].astype(np.float32)
+                if emb.ndim == 1:
+                    emb = emb[np.newaxis, :]
+                _model.add_embeddings(key, emb)
+            via = "pre-computed embeddings"
+    else:
+        for entry in manifest["gallery"]:
+            img_path = DEMO_DIR / entry["file"]
+            if img_path.exists():
+                _model.enroll(entry["identity"], [Image.open(str(img_path)).convert("RGB")])
+        via = "on-the-fly embedding"
 
-    return res_dict
-
-
-@app.get("/cross-dataset")
-def get_cross_dataset():
-    """Returns zero-shot cross-dataset evaluation results across benchmark repositories."""
-    cross_path = os.path.join(RESULTS_DIR, "cross_dataset.json")
-    if not os.path.isfile(cross_path):
-        return {
-            "status": "empty",
-            "message": "Run scripts/evaluate_cross_dataset.py to populate cross-dataset benchmarks",
-            "datasets": {},
-        }
-    with open(cross_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    _demo_loaded = True
     return {
-        "status": "ready",
-        "datasets": data,
+        "status": "loaded",
+        "enrolled_identities": len(_model.rows),
+        "method": via,
+        "gallery_entries": len(manifest.get("gallery", [])),
+        "probe_entries":   len(manifest.get("probes", [])),
     }
 
 
-@app.get("/robustness")
-def get_robustness():
-    """Returns perturbation stress-test benchmarks across 50 random queries."""
-    rob_path = os.path.join(RESULTS_DIR, "robustness.json")
-    if not os.path.isfile(rob_path):
-        return {
-            "status": "empty",
-            "message": "Run scripts/robustness_check.py to populate robustness benchmarks",
-            "perturbations": {},
-        }
-    with open(rob_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+@app.get("/api/demo/status")
+def demo_status():
     return {
-        "status": "ready",
-        "perturbations": data,
+        "demo_loaded": _demo_loaded,
+        "enrolled_identities": len(_model.rows),
+        "identities": list(_model.rows.keys()),
     }
 
 
-@app.post("/demo/scenario")
-def run_demo_scenario():
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
+@app.post("/api/demo/smoke-test")
+def smoke_test():
     """
-    Executes the 3-step live demo scenario on real benchmark probes:
-    Step 1: Genuine probe -> ACCEPTED
-    Step 2: Distant visitor probe -> UNKNOWN (low similarity)
-    Step 3: Look-alike impostor probe -> UNKNOWN (look-alike safety barrier refused)
+    Run demo probes through the loaded gallery.
+    Returns known-accepted and look-alike-false-accept counts.
     """
-    global matcher, extractor
-    if not matcher or not extractor:
-        raise HTTPException(status_code=500, detail="Matching engine not initialized")
+    manifest_p = DEMO_DIR / "demo_manifest.json"
+    if not manifest_p.exists():
+        raise HTTPException(404, "demo_manifest.json not found.")
+    if not _model.rows:
+        raise HTTPException(400, "Gallery empty. Call POST /api/demo/load first.")
 
-    demo_steps = [
-        {
-            "step": 1,
-            "title": "Step 1: Genuine Staff Acceptance",
-            "category": "genuine",
-            "probe_path": "data/sample_market1501/query/0026_c4s1_002604_00.jpg",
-            "probe_url": "/static/data/sample_market1501/query/0026_c4s1_002604_00.jpg",
-            "expected": "ACCEPTED",
-            "caption": "Genuine staff member (Identity 26) correctly recognized with high similarity (0.853) and distinct competitive margin (0.231).",
-        },
-        {
-            "step": 2,
-            "title": "Step 2: Unenrolled Distant Visitor Rejection",
-            "category": "distant_visitor",
-            "probe_path": "data/sample_market1501/bounding_box_test/0004_c3s1_000403_00.jpg",
-            "probe_url": "/static/data/sample_market1501/bounding_box_test/0004_c3s1_000403_00.jpg",
-            "expected": "UNKNOWN",
-            "caption": "Unenrolled visitor cleanly rejected as UNKNOWN due to similarity (0.588) falling below the operating threshold.",
-        },
-        {
-            "step": 3,
-            "title": "Step 3: Uniform Look-Alike Impostor Refusal (The Core Novelty)",
-            "category": "lookalike_impostor",
-            "probe_path": "data/sample_market1501/bounding_box_test/0030_c3s1_003003_00.jpg",
-            "probe_url": "/static/data/sample_market1501/bounding_box_test/0030_c3s1_003003_00.jpg",
-            "expected": "UNKNOWN",
-            "caption": "Look-alike impostor safely refused. Plain cosine produces a dangerous False Accept (similarity 0.740 >= 0.70), while Discern activates the competitive margin barrier (margin 0.014 < 0.067) to safely reject admittance.",
-        },
-    ]
-
+    manifest = json.loads(manifest_p.read_text())
+    ok = tot = fa = unk = 0
     results = []
-    for s in demo_steps:
-        full_p = os.path.join(PROJECT_ROOT, s["probe_path"])
-        if not os.path.isfile(full_p):
+
+    for p in manifest.get("probes", []):
+        img_path = DEMO_DIR / p["file"]
+        if not img_path.exists():
             continue
-        img = Image.open(full_p).convert("RGB")
-        emb = extractor.extract(img)
-        match_res = matcher.match(emb)
-        res_d = match_res.to_dict()
-
-        # Baseline comparison
-        top_cand = res_d["top_candidates"][0] if res_d.get("top_candidates") else None
-        baseline_accepted = (res_d["raw_similarity"] >= 0.70) and (top_cand is not None)
-        is_false_accept = baseline_accepted and (match_res.decision == "UNKNOWN")
-
-        # Candidate thumbnails
-        for cand in res_d.get("top_candidates", []):
-            cid = cand["identity_id"]
-            proto = matcher.prototypes.get(cid)
-            cand["thumbnail_url"] = (
-                f"/static/{os.path.relpath(proto.image_paths[0], PROJECT_ROOT).replace('\\', '/')}"
-                if proto and proto.image_paths
-                else None
-            )
-
+        img = Image.open(str(img_path)).convert("RGB")
+        r = _model.identify(img)
+        truth    = p.get("truth", "")
+        expected = p.get("expected", "")
+        if truth == "enrolled":
+            tot += 1
+            ok  += int(r["identity"] == expected)
+        else:
+            unk += 1
+            fa  += int(r["decision"] == "accept")
         results.append({
-            "step": s["step"],
-            "title": s["title"],
-            "category": s["category"],
-            "probe_url": s["probe_url"],
-            "caption": s["caption"],
-            "expected": s["expected"],
-            "discern_verdict": match_res.decision,
-            "baseline_verdict": "ACCEPTED" if baseline_accepted else "UNKNOWN",
-            "is_false_accept_prevented": is_false_accept,
-            "confidence": res_d["calibrated_confidence"],
-            "similarity": res_d["raw_similarity"],
-            "competitor_similarity": res_d["competitor_similarity"],
-            "margin": res_d["margin"],
-            "margin_delta": res_d["operating_point"]["margin_delta"],
-            "threshold_tau": res_d["operating_point"]["threshold_tau"],
-            "human_reason": res_d["human_reason"],
-            "top_candidates": res_d.get("top_candidates", [])[:2],
+            "file": p["file"], "truth": truth, "expected": expected,
+            "decision": r["decision"], "identity": r.get("identity"),
+            "confidence": r["confidence"],
         })
 
     return {
-        "status": "success",
-        "scenario_name": "Open-Set Look-Alike Security Audit",
-        "steps": results,
+        "known_accepted": ok,
+        "known_total": tot,
+        "lookalike_false_accepts": fa,
+        "lookalike_total": unk,
+        "details": results,
     }
 
 
-@app.put("/operating-point")
-def update_operating_point(update: OperatingPointUpdate):
-    """Updates the target false-accept rate (alpha) and adjusts operating thresholds live."""
-    global matcher
-    if not matcher:
-        raise HTTPException(status_code=500, detail="Matching engine not initialized")
+# ---------------------------------------------------------------------------
+# Legacy compatibility shims (keep old frontend working during transition)
+# ---------------------------------------------------------------------------
+@app.get("/gallery")
+def legacy_gallery():
+    return get_gallery()
 
-    op = matcher.set_operating_point(update.alpha)
-    return {
-        "status": "success",
-        "operating_point": op,
-    }
+
+@app.delete("/identity/{identity_id}")
+def legacy_delete(identity_id: str):
+    return delete_identity(identity_id)
 
 
 @app.get("/metrics")
-def get_metrics():
-    """Returns headline metrics from real evaluation run."""
-    eval_path = os.path.join(RESULTS_DIR, "evaluation_results.json")
-    if not os.path.isfile(eval_path):
-        return {
-            "status": "empty",
-            "message": "Run evaluation to populate metrics",
-            "headline_metrics": None,
-            "metadata": None,
-        }
-
-    with open(eval_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    return {
-        "status": "ready",
-        "headline_metrics": data.get("headline_metrics"),
-        "metadata": data.get("metadata"),
-        "default_configuration": data.get("default_configuration"),
-        "uniform_stress_test": data.get("uniform_stress_test"),
-        "latency_and_parameters": data.get("latency_and_parameters"),
-        "analysis_paragraph": data.get("analysis_paragraph"),
-    }
-
-
-@app.get("/roc")
-def get_roc():
-    """Returns ROC curve points for frontend Recharts plotting."""
-    roc_path = os.path.join(RESULTS_DIR, "roc_curve.json")
-    if not os.path.isfile(roc_path):
-        return {
-            "status": "empty",
-            "message": "Run evaluation to populate ROC curves",
-            "roc_curves": None,
-        }
-
-    with open(roc_path, "r", encoding="utf-8") as f:
-        roc_data = json.load(f)
-
-    return {
-        "status": "ready",
-        "roc_curves": roc_data,
-        "chart_png_url": "/static/results/roc_chart.png",
-    }
-
-
-@app.get("/ablation")
-def get_ablation():
-    """Returns step-by-step ablation study table."""
-    eval_path = os.path.join(RESULTS_DIR, "evaluation_results.json")
-    if not os.path.isfile(eval_path):
-        return {
-            "status": "empty",
-            "message": "Run evaluation to populate ablation table",
-            "ablation_study": [],
-        }
-
-    with open(eval_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    return {
-        "status": "ready",
-        "ablation_study": data.get("ablation_study", []),
-    }
+def legacy_metrics():
+    try:
+        return get_metrics()
+    except HTTPException:
+        return {"status": "empty"}
 
 
 @app.get("/lookalikes")
-def get_lookalikes():
-    """Returns curated look-alike pairs and clusters with representative image URLs."""
-    lowvar_path = os.path.join(RESULTS_DIR, "lowvar_subset.json")
-    if not os.path.isfile(lowvar_path):
+def legacy_lookalikes():
+    try:
+        data = get_lookalikes()
+        pairs = [
+            {
+                "identity_a":          pair.get("id_a"),
+                "identity_b":          pair.get("id_b"),
+                "clothing_similarity": pair.get("colour_similarity", 0.0),
+                "impostor_similarity": pair.get("impostor_similarity", 0.0),
+                "impostor_confidence": pair.get("impostor_confidence", 0.0),
+                "genuine_similarity":  pair.get("genuine_similarity", 0.0),
+                "image_url_a":         pair.get("image_a_url"),
+                "image_url_b":         pair.get("image_b_url"),
+                "genuine_image_1_url": pair.get("genuine_image_1_url"),
+                "genuine_image_2_url": pair.get("genuine_image_2_url"),
+                "rank":                pair.get("rank", 0),
+            }
+            for pair in data.get("pairs", [])
+        ]
         return {
-            "status": "empty",
-            "message": "Run prepare_data.py to populate look-alike clusters",
-            "pairs": [],
-            "clusters": [],
+            "status": "ready",
+            "pairs": pairs,
+            "metadata": {"total_pairs": len(pairs), "description": data.get("description", "")},
         }
-
-    with open(lowvar_path, "r", encoding="utf-8") as f:
-        lowvar = json.load(f)
-
-    split_path = os.path.join(RESULTS_DIR, "open_set_split.json")
-    id_to_img = {}
-    if os.path.isfile(split_path):
-        with open(split_path, "r", encoding="utf-8") as sf:
-            sdata = json.load(sf)
-            all_samples = (
-                sdata.get("gallery_samples", [])
-                + sdata.get("genuine_probe_samples", [])
-                + sdata.get("impostor_probe_samples", [])
-            )
-            for s in all_samples:
-                pid = s["identity_id"]
-                if pid not in id_to_img:
-                    id_to_img[pid] = f"/static/{os.path.relpath(s['image_path'], PROJECT_ROOT).replace('\\', '/')}"
-
-    if matcher:
-        for pid, proto in matcher.prototypes.items():
-            if proto.image_paths and pid not in id_to_img:
-                id_to_img[pid] = f"/static/{os.path.relpath(proto.image_paths[0], PROJECT_ROOT).replace('\\', '/')}"
-
-    pairs = lowvar.get("top_lookalike_pairs", [])
-    for p in pairs:
-        p["image_url_a"] = id_to_img.get(p["identity_a"])
-        p["image_url_b"] = id_to_img.get(p["identity_b"])
-
-    return {
-        "status": "ready",
-        "metadata": lowvar.get("metadata", {}),
-        "tightest_clusters": lowvar.get("tightest_clusters", []),
-        "clusters": lowvar.get("tightest_clusters", []),
-        "pairs": pairs,
-    }
+    except HTTPException:
+        return {"status": "empty", "pairs": [], "metadata": {}}
 
 
+# ---------------------------------------------------------------------------
+# Dev runner
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("backend.app.main:app", host="127.0.0.1", port=8000, reload=False)

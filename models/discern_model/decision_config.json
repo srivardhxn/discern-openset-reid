@@ -1,0 +1,174 @@
+{
+ "model": {
+  "name": "Discern-R50-BNNeck",
+  "architecture": "ResNet-50 (last stride 1) + GeM + BNNeck",
+  "embedding_dim": 2048,
+  "onnx": "discern_embedder.onnx",
+  "torchscript": "discern_embedder.torchscript.pt",
+  "pytorch_weights": "discern_reid_r50.pt",
+  "onnx_validated": true
+ },
+ "preprocess": {
+  "input_size_hw": [
+   288,
+   144
+  ],
+  "colour": "RGB",
+  "range": "float32 0..1, NCHW",
+  "resize": "stretch the person crop to WxH (bilinear); no padding",
+  "normalisation": "done INSIDE the exported model (ImageNet mean/std) - do not normalise again"
+ },
+ "embedding": {
+  "l2_normalised": true,
+  "similarity": "cosine (dot product)",
+  "flip_tta": true,
+  "tta_recipe": "e = normalize(embed(x) + embed(horizontal_flip(x)))  <- used for enrolment AND probes"
+ },
+ "matching": {
+  "aggregation": "max",
+  "aggregation_note": "identity score = mean of the top-k image similarities of that identity (max when k=1)",
+  "decision": "confidence = sigmoid(coef . standardise([s1, margin, z]) + intercept); accept iff confidence > operating-point threshold; else REJECT as 'unknown'",
+  "features": {
+   "s1": "best identity score",
+   "margin": "s1 minus runner-up identity score",
+   "z": "(s1 - mean(all identity scores)) / std(all identity scores)"
+  },
+  "min_identities_full_calibrator": 10,
+  "fallback": "s1_margin if >=2 identities, s1 if 1 identity"
+ },
+ "calibrators": {
+  "s1": {
+   "features": [
+    "s1"
+   ],
+   "mean": [
+    0.5864132501680466
+   ],
+   "scale": [
+    0.16013769254068552
+   ],
+   "coef": [
+    3.329706699099815
+   ],
+   "intercept": -0.16755907537401735,
+   "operating_points": {
+    "strict": {
+     "threshold": 0.9894941688789028,
+     "target_far": 0.001,
+     "far": 0.0008932825154835636,
+     "far_lookalike_lv90": 0.006455399061032864,
+     "tar": 0.14175746091899574
+    },
+    "balanced": {
+     "threshold": 0.9415919708526291,
+     "target_far": 0.01,
+     "far": 0.009945212005717009,
+     "far_lookalike_lv90": 0.0539906103286385,
+     "tar": 0.49532212221695876
+    },
+    "lenient": {
+     "threshold": 0.6838980165456993,
+     "target_far": 0.05,
+     "far": 0.04996426869938066,
+     "far_lookalike_lv90": 0.15434272300469484,
+     "tar": 0.8022264329701563
+    }
+   }
+  },
+  "s1_margin": {
+   "features": [
+    "s1",
+    "m"
+   ],
+   "mean": [
+    0.5864132501680466,
+    0.15999064552741493
+   ],
+   "scale": [
+    0.16013769254068547,
+    0.13693056571963197
+   ],
+   "coef": [
+    2.2107493471033934,
+    1.6229952850944365
+   ],
+   "intercept": 0.12379348608648257,
+   "operating_points": {
+    "strict": {
+     "threshold": 0.9980539314719299,
+     "target_far": 0.001,
+     "far": 0.0008932825154835636,
+     "far_lookalike_lv90": 0.007629107981220657,
+     "tar": 0.08799147323543344
+    },
+    "balanced": {
+     "threshold": 0.962623706456085,
+     "target_far": 0.01,
+     "far": 0.009945212005717009,
+     "far_lookalike_lv90": 0.05575117370892019,
+     "tar": 0.51468498342018
+    },
+    "lenient": {
+     "threshold": 0.6490097782113131,
+     "target_far": 0.05,
+     "far": 0.04996426869938066,
+     "far_lookalike_lv90": 0.13086854460093897,
+     "tar": 0.8276882993841781
+    }
+   }
+  },
+  "s1_margin_z": {
+   "features": [
+    "s1",
+    "m",
+    "z"
+   ],
+   "mean": [
+    0.5864132501680466,
+    0.15999064552741493,
+    6.31743272979016
+   ],
+   "scale": [
+    0.16013769254068547,
+    0.13693056571963197,
+    1.764927764116903
+   ],
+   "coef": [
+    2.287138990218338,
+    1.6692674847998552,
+    -0.12476695470507347
+   ],
+   "intercept": 0.128661830248419,
+   "operating_points": {
+    "strict": {
+     "threshold": 0.9980789814729383,
+     "target_far": 0.001,
+     "far": 0.0009528346831824678,
+     "far_lookalike_lv90": 0.008215962441314555,
+     "tar": 0.08787304594978683
+    },
+    "balanced": {
+     "threshold": 0.9629119808106059,
+     "target_far": 0.01,
+     "far": 0.009945212005717009,
+     "far_lookalike_lv90": 0.05457746478873239,
+     "tar": 0.5137967787778304
+    },
+    "lenient": {
+     "threshold": 0.6510550045124327,
+     "target_far": 0.05,
+     "far": 0.04996426869938066,
+     "far_lookalike_lv90": 0.13204225352112675,
+     "tar": 0.8268593083846518
+    }
+   }
+  }
+ },
+ "default_operating_point": "balanced",
+ "protocol": {
+  "dataset": "Market-1501 (test identities, 750)",
+  "split": "50% enrolled / 50% unknown, 10 random splits",
+  "lookalike_subsets": "LV75/LV90 = probes whose nearest enrolled colour-twin is in the top 25% / 10% of upper+lower-body HSV similarity",
+  "note": "Thresholds were fitted with ~375 enrolled identities; gallery size shifts score statistics - keep the UI slider."
+ }
+}

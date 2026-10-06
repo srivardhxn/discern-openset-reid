@@ -54,7 +54,7 @@ export const App: React.FC = () => {
           <div className="flex items-center space-x-3 text-[11px] font-mono">
             <span>FastAPI: :8000</span>
             <span>•</span>
-            <span>OSNet x0.5 (0.61M params)</span>
+            <span>Discern-R50-BNNeck (ONNX)</span>
             <span>•</span>
             <span className="text-[#16A34A] font-semibold flex items-center">
               <span className="w-1.5 h-1.5 rounded-full bg-[#16A34A] mr-1" />

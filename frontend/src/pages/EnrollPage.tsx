@@ -9,7 +9,7 @@ export const EnrollPage: React.FC<{ onGalleryChange?: () => void }> = ({ onGalle
   const [files, setFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState<boolean>(false);
   const [msg, setMsg] = useState<{ type: "success" | "error"; text: string } | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<{ id: number; name: string } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
   const [deleting, setDeleting] = useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -66,7 +66,7 @@ export const EnrollPage: React.FC<{ onGalleryChange?: () => void }> = ({ onGalle
       await api.enrollIdentity(name.trim(), files);
       setName("");
       setFiles([]);
-      setMsg({ type: "success", text: `Successfully enrolled identity '${name}'. Gallery whitening and prototypes updated.` });
+      setMsg({ type: "success", text: `Successfully enrolled identity '${name}' with ${files.length} image(s).` });
       await loadGallery();
     } catch (err: any) {
       setMsg({ type: "error", text: err.message || "Enrollment failed" });
@@ -80,7 +80,7 @@ export const EnrollPage: React.FC<{ onGalleryChange?: () => void }> = ({ onGalle
     try {
       setDeleting(true);
       await api.deleteIdentity(deleteTarget.id);
-      setMsg({ type: "success", text: `Identity '${deleteTarget.name}' (ID ${deleteTarget.id}) deleted. Whitening re-fitted.` });
+      setMsg({ type: "success", text: `Identity '${deleteTarget.name}' deleted.` });
       setDeleteTarget(null);
       await loadGallery();
     } catch (err: any) {
@@ -240,22 +240,19 @@ export const EnrollPage: React.FC<{ onGalleryChange?: () => void }> = ({ onGalle
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {gallery.map((item) => (
-              <div key={item.identity_id} className="border border-[#E5E7EB] rounded-lg p-4 bg-white flex flex-col justify-between">
+              <div key={item.identity ?? item.identity_id} className="border border-[#E5E7EB] rounded-lg p-4 bg-white flex flex-col justify-between">
                 <div>
                   <div className="flex items-start justify-between">
                     <div>
-                      <div className="text-xs font-bold text-[#0A0A0A] flex items-center">
-                        {item.name}
-                        <span className="ml-2 text-[10px] text-[#6B7280] font-mono bg-[#FAFAFA] border border-[#E5E7EB] px-1.5 py-0.2 rounded">
-                          ID: {item.identity_id}
-                        </span>
+                      <div className="text-xs font-bold text-[#0A0A0A]">
+                        {item.identity ?? item.name}
                       </div>
                       <div className="text-[11px] text-[#6B7280] mt-0.5 font-mono">
-                        {item.num_samples} crops • {item.num_exemplars} exemplars
+                        {item.num_embeddings ?? item.num_samples ?? 0} embeddings
                       </div>
                     </div>
                     <button
-                      onClick={() => setDeleteTarget({ id: item.identity_id, name: item.name })}
+                      onClick={() => setDeleteTarget({ id: String(item.identity ?? item.identity_id), name: String(item.identity ?? item.name) })}
                       title="Delete Identity"
                       className="text-[#6B7280] hover:text-[#DC2626] p-1.5 rounded hover:bg-[#F9FAFB] transition-colors"
                     >
@@ -263,39 +260,11 @@ export const EnrollPage: React.FC<{ onGalleryChange?: () => void }> = ({ onGalle
                     </button>
                   </div>
 
-                  {/* Thumbnail Strip */}
-                  <div className="flex space-x-1.5 my-3 overflow-x-auto py-1">
-                    {item.image_urls && item.image_urls.length > 0 ? (
-                      item.image_urls.slice(0, 4).map((url, i) => (
-                        <img
-                          key={i}
-                          src={`${API_BASE}${url}`}
-                          alt="crop"
-                          className="w-12 h-20 object-cover rounded border border-[#E5E7EB] bg-[#F9FAFB]"
-                          onError={(e) => {
-                            (e.target as any).style.display = "none";
-                          }}
-                        />
-                      ))
-                    ) : (
-                      <div className="w-12 h-20 bg-[#F9FAFB] border border-[#E5E7EB] rounded flex items-center justify-center text-[10px] text-[#9CA3AF]">
-                        No img
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Adaptive Threshold info */}
-                  <div className="space-y-1 text-[11px] border-t border-[#E5E7EB] pt-2 text-[#4B5563]">
-                    <div className="flex justify-between">
-                      <span>Adaptive Threshold (τᵢ):</span>
-                      <span className="font-semibold text-[#111827]">{item.adaptive_tau.toFixed(3)}</span>
-                    </div>
-                    {item.nearest_lookalike_id && (
-                      <div className="flex justify-between items-center text-[#D97706] bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">
-                        <span>Nearest Look-Alike: ID {item.nearest_lookalike_id}</span>
-                        <span className="font-medium">{(item.nearest_lookalike_sim * 100).toFixed(1)}% sim</span>
-                      </div>
-                    )}
+                  {/* No image thumbnails in ONNX backend (embeddings stored in memory) */}
+                  <div className="my-3 py-4 bg-[#F9FAFB] border border-[#E5E7EB] rounded flex items-center justify-center">
+                    <span className="text-[10px] text-[#9CA3AF] font-mono">
+                      {item.num_embeddings ?? 0} embedding vector{(item.num_embeddings ?? 0) !== 1 ? "s" : ""} enrolled
+                    </span>
                   </div>
                 </div>
               </div>

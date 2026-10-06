@@ -69,3 +69,6 @@ Thumbs.db
 !weights/osnet_discern.pth
 !results/
 scratch/
+
+# PyTorch large model checkpoints (>100MB exceed GitHub push limits; backend runs on ONNX)
+*.pt

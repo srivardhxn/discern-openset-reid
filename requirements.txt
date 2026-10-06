@@ -1,14 +1,20 @@
 # Discern Core Dependencies (Pinned for Windows 11 / Python 3.10+)
-torch>=2.2.0
-torchvision>=0.17.0
+# ONNX inference backend (GPU preferred, CPU fallback)
+# Install GPU version: pip install onnxruntime-gpu
+# Install CPU version: pip install onnxruntime
+onnxruntime-gpu>=1.17.0; sys_platform != "darwin"
+onnxruntime>=1.17.0; sys_platform == "darwin"
 fastapi==0.115.0
 uvicorn==0.30.6
 pydantic==2.8.2
 python-multipart==0.0.9
 numpy>=1.26.0,<2.1.0
-scikit-learn>=1.4.0
-opencv-python-headless>=4.8.0
 pillow>=10.2.0
 requests>=2.31.0
 pytest>=8.0.0
-matplotlib>=3.8.0
+# Optional: PyTorch (only needed for TorchScript model or training scripts)
+# torch>=2.2.0
+# torchvision>=0.17.0
+# scikit-learn>=1.4.0
+# opencv-python-headless>=4.8.0
+# matplotlib>=3.8.0
