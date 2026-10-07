@@ -1,0 +1,192 @@
+================================================================================
+DISCERN: Open-Set Person Re-Identification Under Low Inter-Class Variance
+PROJECT EVALUATION & EXECUTION GUIDE
+================================================================================
+
+Student / Author Project Submission
+Repository: https://github.com/srivardhxn/discern-openset-reid
+Stack: Python 3.10+ | FastAPI | ONNX Runtime | React 18 | Vite | Tailwind CSS
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS:
+1. WHAT THIS PROJECT DOES & WHAT IS HAPPENING UNDER THE HOOD
+2. SYSTEM PREREQUISITES
+3. STEP-BY-STEP INSTRUCTIONS: HOW TO RUN
+4. INSTANT 30-SECOND CLI TEST (VERIFY WITHOUT OPENING BROWSER)
+5. HOW TO TEST THE INTERACTIVE WEB DASHBOARD
+6. API DOCUMENTATION (SWAGGER)
+7. PROJECT FOLDER STRUCTURE
+8. TROUBLESHOOTING COMMON ISSUES
+--------------------------------------------------------------------------------
+
+
+================================================================================
+1. WHAT THIS PROJECT DOES & WHAT IS HAPPENING UNDER THE HOOD
+================================================================================
+Traditional Person Re-Identification (Re-ID) assumes a "closed-set" system:
+it forces a match against the database even if the person in front of the camera
+is an unknown stranger. Furthermore, in real environments like hospitals,
+factories, airports, and security zones, workers wear IDENTICAL UNIFORMS (low
+appearance variance). Traditional models get confused and falsely match strangers
+wearing the same uniform (high False Accept Rate).
+
+DISCERN solves this with an OPEN-SET Re-ID architecture:
+
+A. DEEP FEATURE EMBEDDING (ResNet-50 + GeM + BNNeck):
+   - Input person crop is standardized and resized to 288x144.
+   - ResNet-50 with last-stride=1 extracts fine-grained spatial features.
+   - Generalized Mean (GeM) Pooling captures salient cues better than average pooling.
+   - Batch Normalization Neck outputs a 2048-dimensional L2-normalized vector.
+   - Horizontal Flip Test-Time Augmentation (TTA) embeds both original and flipped
+     images to ensure pose-invariant embeddings.
+
+B. TRIPLE-FEATURE DECISION ENGINE:
+   Instead of relying solely on raw cosine similarity, Discern extracts 3 signals:
+   1. s1 (Top-1 Similarity): Cosine similarity to best gallery candidate.
+   2. Margin (m = s1 - s2): Gap between top candidate and runner-up candidate.
+      If two people wear identical uniforms, margin is low; this prevents false accepts.
+   3. Query Z-score (z = (s1 - mean) / std): How far the top match stands out
+      against the gallery background distribution.
+
+C. CALIBRATED PROBABILITY & OPERATING THRESHOLDS:
+   A calibrated logistic regressor converts (s1, margin, z) into a posterior confidence.
+   - Strict   (Threshold 0.998): False Accept Rate only 0.10% (High security).
+   - Balanced (Threshold 0.963): Default production mode (FAR 0.99%, TAR 51.4%).
+   - Lenient  (Threshold 0.651): Investigative review (FAR 5.0%, TAR 82.7%).
+   - If confidence is below the threshold, the system returns "UNKNOWN" (Rejected).
+
+
+================================================================================
+2. SYSTEM PREREQUISITES
+================================================================================
+- OS: Windows 10/11, macOS, or Linux.
+- Python: Version 3.10 or higher (check with: python --version)
+- Node.js: Version 18 or higher with npm (check with: node --version)
+- Hardware: Standard CPU (ONNX Runtime is optimized for CPU; NVIDIA GPU is
+  automatically utilized if CUDA is available).
+
+
+================================================================================
+3. STEP-BY-STEP INSTRUCTIONS: HOW TO RUN
+================================================================================
+
+METHOD A: AUTOMATED 1-CLICK SCRIPTS (WINDOWS POWERSHELL)
+-------------------------------------------------------
+Open PowerShell inside the project directory:
+
+Step 1: Setup Environment (One-time)
+   .\setup.ps1
+   (This creates .venv, installs Python dependencies, and runs npm install)
+
+Step 2: Start Backend Server
+   .\run_api.ps1
+   (Server starts at http://localhost:8000. API Docs at http://localhost:8000/docs)
+
+Step 3: Start Frontend Web UI (In a new terminal window)
+   .\run_ui.ps1
+   (Web app opens at http://localhost:5173)
+
+
+METHOD B: MANUAL COMMANDS (ALL OPERATING SYSTEMS)
+-------------------------------------------------
+TERMINAL 1 (Backend API):
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1       (On Linux/macOS: source .venv/bin/activate)
+   pip install -r requirements.txt
+   python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+
+TERMINAL 2 (Frontend UI):
+   cd frontend
+   npm install
+   npm run dev
+   (Open browser at http://localhost:5173)
+
+
+================================================================================
+4. INSTANT 30-SECOND CLI TEST (VERIFY WITHOUT OPENING BROWSER)
+================================================================================
+You can immediately verify the model, pipeline, and decision rules via PyTest:
+
+   .\.venv\Scripts\pytest.exe tests/test_model_bundle.py -v
+
+What this verifies:
+- Confirms 2048-dim ONNX embedder architecture and decision thresholds.
+- Replays 40 gallery identities and 40 probes from the bundled demo.
+- Confirms 40/40 known probes accepted (100% TAR) and verifies look-alike rejection.
+
+
+================================================================================
+5. HOW TO TEST THE INTERACTIVE WEB DASHBOARD (http://localhost:5173)
+================================================================================
+Once both backend and frontend are running, open http://localhost:5173 in browser:
+
+1. "OVERVIEW" TAB:
+   - View system architecture diagram.
+   - View benchmark results (Rank-1 94.2%, mAP 86.3%, ECE 0.014).
+   - View training recipe and inference ablation tables.
+
+2. "GALLERY & ENROLL" TAB:
+   - Click "Load Bundled Demo Gallery" to preload 40 identities in 1 click!
+   - Or drag-and-drop new person crop images, type a Name/ID, and click "Enroll".
+
+3. "MATCH / IDENTIFY" TAB (CORE DEMO):
+   - Choose a probe image (or test with crops in model/demo/).
+   - Select Operating Point (Strict, Balanced, or Lenient).
+   - Click "Identify".
+   - See the result: Green "MATCH ACCEPTED" with Identity, Confidence %,
+     Top Similarity, Margin, and Z-score, OR Amber "UNKNOWN PERSON (REJECTED)".
+
+4. "LOOK-ALIKES EXPLORER" TAB:
+   - Explore the 60 hardest confusable pairs (people wearing identical clothing).
+   - Observe how Discern's margin metric prevents false accepts.
+
+5. "EVALUATION & REPORTS" TAB:
+   - Inspect ROC curves, reliability calibration diagrams, and ablation charts.
+
+
+================================================================================
+6. API DOCUMENTATION (SWAGGER)
+================================================================================
+While the backend is running, open:
+   http://localhost:8000/docs
+Here you can interactively test API endpoints (/api/enroll, /api/identify,
+/api/lookalikes, /api/config, /api/metrics).
+
+
+================================================================================
+7. PROJECT DIRECTORY LAYOUT
+================================================================================
+discern/
+├── EVALUATION_GUIDE.md               (Markdown evaluation document)
+├── HOW_TO_RUN_AND_EVALUATION_STEPS.txt (This file)
+├── setup.ps1                         (Automated setup script)
+├── run_api.ps1                       (Backend launcher)
+├── run_ui.ps1                        (Frontend launcher)
+├── requirements.txt                  (Python packages)
+├── backend/app/main.py               (FastAPI application)
+├── frontend/                         (React + Vite + Tailwind source code)
+├── model/
+│   ├── discern_embedder.onnx         (Exported ONNX model, 2048-d)
+│   ├── decision_config.json          (Calibrators and thresholds)
+│   ├── discern_inference.py          (ONNX Runtime decision logic)
+│   ├── demo/                         (40 gallery & 40 probe test crops)
+│   └── reports/                      # Evaluation charts and figures
+├── Notebook Scripts/visionmodel.ipynb(Model training notebook)
+├── scripts/smoke_test.py             (CLI verification script)
+└── tests/test_model_bundle.py        (PyTest test suite)
+
+
+================================================================================
+8. TROUBLESHOOTING
+================================================================================
+- Error: "running scripts is disabled on this system"
+  Fix: Run in PowerShell: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+- Port 8000 or 5173 already occupied:
+  Fix: Close existing terminal or specify different port:
+       uvicorn backend.app.main:app --port 8001
+- Python not recognized: Ensure Python 3.10+ is installed and "Add to PATH" was checked.
+- Node not recognized: Ensure Node.js 18+ is installed from nodejs.org.
+
+================================================================================
+End of Guide.
+================================================================================
